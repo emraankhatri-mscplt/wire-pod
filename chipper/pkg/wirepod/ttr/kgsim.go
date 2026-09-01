@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -343,9 +344,9 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 		BControl(robot, ctx, start, stop)
 	}
 
-	interrupted := false
+	var interrupted atomic.Bool
 	go func() {
-		interrupted = InterruptKGSimWhenTouchedOrWaked(robot, stop, stopStop)
+		interrupted.Store(InterruptKGSimWhenTouchedOrWaked(robot, stop, stopStop))
 	}()
 
 	var TTSLoopAnimation string
@@ -412,9 +413,18 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 	convo := append([]llm.Message{}, aireq.Messages...)
 	convo = append(convo, llm.Message{Role: llm.RoleAssistant})
 
+	// Make sure the stream reader can always finish, even if speaking is
+	// interrupted, so its goroutine never leaks.
+	defer func() {
+		go func() {
+			for range segments {
+			}
+		}()
+	}()
+
 	segment := firstSegment
 	for {
-		if interrupted {
+		if interrupted.Load() {
 			break
 		}
 		logger.Println(segment)
@@ -433,7 +443,7 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 	ttsLoopStopped.Wait()
 	time.Sleep(time.Millisecond * 100)
 
-	if !interrupted {
+	if !interrupted.Load() {
 		select {
 		case stopStop <- true:
 		default:
