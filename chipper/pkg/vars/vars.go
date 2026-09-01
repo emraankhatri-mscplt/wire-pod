@@ -15,7 +15,7 @@ import (
 
 	"github.com/fforchino/vector-go-sdk/pkg/vector"
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
-	"github.com/sashabaranov/go-openai"
+	"github.com/kercre123/wire-pod/chipper/pkg/wirepod/llm"
 	"github.com/wlynxg/anet"
 )
 
@@ -80,8 +80,8 @@ var ChipperKeysLoaded bool
 var RecurringInfo []RecurringInfoStore
 
 type RememberedChat struct {
-	ESN   string                         `json:"esn"`
-	Chats []openai.ChatCompletionMessage `json:"chats"`
+	ESN   string        `json:"esn"`
+	Chats []llm.Message `json:"chats"`
 }
 
 var RememberedChats []RememberedChat

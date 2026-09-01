@@ -8,6 +8,8 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -18,7 +20,7 @@ import (
 	"github.com/fforchino/vector-go-sdk/pkg/vectorpb"
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
 	"github.com/kercre123/wire-pod/chipper/pkg/vars"
-	"github.com/sashabaranov/go-openai"
+	"github.com/kercre123/wire-pod/chipper/pkg/wirepod/llm"
 )
 
 func GetChat(esn string) vars.RememberedChat {
@@ -43,8 +45,8 @@ func PlaceChat(chat vars.RememberedChat) {
 }
 
 // remember last 16 lines of chat
-func Remember(user, ai openai.ChatCompletionMessage, esn string) {
-	chatAppend := []openai.ChatCompletionMessage{
+func Remember(user, ai llm.Message, esn string) {
+	chatAppend := []llm.Message{
 		user,
 		ai,
 	}
@@ -134,98 +136,136 @@ func removeEmojis(input string) string {
 	return result
 }
 
-func CreateAIReq(transcribedText, esn string, gpt3tryagain, isKG bool) openai.ChatCompletionRequest {
+// LLMConfig builds the LLM interface configuration from wire-pod's knowledge
+// settings. The wire format (OpenAI / Anthropic / Gemini) is picked from the
+// model name unless the user pinned one, which matches how apimodels.app
+// routes requests on its unified endpoint.
+func LLMConfig() llm.Config {
+	k := vars.APIConfig.Knowledge
+	return llm.Config{
+		Provider:    k.Provider,
+		Endpoint:    k.Endpoint,
+		Key:         k.Key,
+		Model:       k.Model,
+		Format:      k.APIFormat,
+		Temperature: k.Temperature,
+		TopP:        k.TopP,
+	}
+}
+
+// CreateAIReq builds the request which is sent to the LLM.
+func CreateAIReq(transcribedText, esn string, isKG bool) (llm.Config, llm.Request) {
 	defaultPrompt := "You are a helpful, animated robot called Vector. Keep the response concise yet informative."
 
-	var nChat []openai.ChatCompletionMessage
+	conf := LLMConfig()
 
-	smsg := openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleSystem,
+	system := strings.TrimSpace(vars.APIConfig.Knowledge.OpenAIPrompt)
+	if system == "" {
+		system = defaultPrompt
 	}
-	if strings.TrimSpace(vars.APIConfig.Knowledge.OpenAIPrompt) != "" {
-		smsg.Content = strings.TrimSpace(vars.APIConfig.Knowledge.OpenAIPrompt)
-	} else {
-		smsg.Content = defaultPrompt
-	}
+	system = CreatePrompt(system, conf.ModelName(), isKG)
 
-	var model string
-
-	if gpt3tryagain {
-		model = openai.GPT3Dot5Turbo
-	} else if vars.APIConfig.Knowledge.Provider == "openai" {
-		model = openai.GPT4oMini
-		if m := strings.TrimSpace(vars.APIConfig.Knowledge.Model); m != "" {
-			model = m
-		}
-		logger.Println("Using " + model)
-	} else {
-		logger.Println("Using " + vars.APIConfig.Knowledge.Model)
-		model = vars.APIConfig.Knowledge.Model
-	}
-
-	smsg.Content = CreatePrompt(smsg.Content, model, isKG)
-
-	nChat = append(nChat, smsg)
+	var messages []llm.Message
 	if vars.APIConfig.Knowledge.SaveChat {
 		rchat := GetChat(esn)
 		logger.Println("Using remembered chats, length of " + fmt.Sprint(len(rchat.Chats)) + " messages")
-		nChat = append(nChat, rchat.Chats...)
+		messages = append(messages, rchat.Chats...)
 	}
-	nChat = append(nChat, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
+	messages = append(messages, llm.Message{
+		Role:    llm.RoleUser,
 		Content: transcribedText,
 	})
 
-	aireq := openai.ChatCompletionRequest{
-		Model:               model,
-		MaxCompletionTokens: 2048,
-		Temperature:         1,
-		TopP:                1,
-		FrequencyPenalty:    0,
-		PresencePenalty:     0,
-		Messages:            nChat,
-		Stream:              true,
+	logger.Println("Using " + conf.ModelName() + " (" + conf.WireFormat() + " API format) at " + conf.URL(conf.WireFormat()))
+
+	return conf, llm.Request{
+		System:   system,
+		Messages: messages,
 	}
-	return aireq
+}
+
+// streamSegments consumes an LLM stream and pushes speakable segments onto the
+// returned channel, which is closed once the response is complete. The full
+// response text is sent on the second channel afterwards.
+func streamSegments(stream llm.Stream) (<-chan string, <-chan string) {
+	segments := make(chan string, 64)
+	full := make(chan string, 1)
+	go func() {
+		defer close(full)
+		defer close(segments)
+		defer stream.Close()
+		var seg segmenter
+		var complete strings.Builder
+		for {
+			text, err := stream.Recv()
+			if text != "" {
+				text = removeSpecialCharacters(text)
+				complete.WriteString(text)
+				for _, s := range seg.Add(text) {
+					segments <- s
+				}
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					logger.Println("LLM stream error: " + err.Error())
+				}
+				break
+			}
+		}
+		for _, s := range seg.Flush() {
+			segments <- s
+		}
+		full <- strings.TrimSpace(complete.String())
+	}()
+	return segments, full
+}
+
+func getRobot(esn string) (*vector.Vector, error) {
+	for _, bot := range vars.BotInfo.Robots {
+		if esn == bot.Esn {
+			return vector.New(
+				vector.WithSerialNo(esn),
+				vector.WithToken(bot.GUID),
+				vector.WithTarget(bot.IPAddress+":443"),
+			)
+		}
+	}
+	return nil, errors.New("robot " + esn + " is not authenticated with this wire-pod instance")
 }
 
 func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bool) (string, error) {
-	start := make(chan bool)
-	stop := make(chan bool)
-	stopStop := make(chan bool)
-	kgReadyToAnswer := make(chan bool)
-	kgStopLooping := false
-	ctx := context.Background()
-	matched := false
-	var robot *vector.Vector
-	var guid string
-	var target string
-	for _, bot := range vars.BotInfo.Robots {
-		if esn == bot.Esn {
-			guid = bot.GUID
-			target = bot.IPAddress + ":443"
-			matched = true
-			break
-		}
-	}
-	if matched {
-		var err error
-		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
-		if err != nil {
-			return err.Error(), err
-		}
-	}
-	_, err := robot.Conn.BatteryState(context.Background(), &vectorpb.BatteryStateRequest{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	robot, err := getRobot(esn)
 	if err != nil {
 		return "", err
 	}
+	if _, err := robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{}); err != nil {
+		return "", err
+	}
+
+	// Buffered so that no signal can ever block (and therefore leak) a
+	// goroutine, which is what used to happen when the LLM errored before
+	// behavior control was granted.
+	start := make(chan bool, 1)
+	stop := make(chan bool, 1)
+	stopStop := make(chan bool, 1)
+
+	var searchingStopped sync.WaitGroup
+	searchingCtx, stopSearching := context.WithCancel(ctx)
+	defer stopSearching()
+
 	if isKG {
 		BControl(robot, ctx, start, stop)
+		searchingStopped.Add(1)
 		go func() {
+			defer searchingStopped.Done()
 			for {
-				if kgStopLooping {
-					kgReadyToAnswer <- true
-					break
+				select {
+				case <-searchingCtx.Done():
+					return
+				default:
 				}
 				robot.Conn.PlayAnimation(ctx, &vectorpb.PlayAnimationRequest{
 					Animation: &vectorpb.Animation{
@@ -237,172 +277,78 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 			}
 		}()
 	}
-	var fullRespText string
-	var fullfullRespText string
-	var fullRespSlice []string
-	var isDone bool
-	var c *openai.Client
-	switch vars.APIConfig.Knowledge.Provider {
-	case "together":
-		if vars.APIConfig.Knowledge.Model == "" {
-			vars.APIConfig.Knowledge.Model = "meta-llama/Llama-3-70b-chat-hf"
-			vars.WriteConfigToDisk()
-		}
-		conf := openai.DefaultConfig(vars.APIConfig.Knowledge.Key)
-		conf.BaseURL = "https://api.together.xyz/v1"
-		c = openai.NewClientWithConfig(conf)
-	case "custom":
-		conf := openai.DefaultConfig(vars.APIConfig.Knowledge.Key)
-		conf.BaseURL = vars.APIConfig.Knowledge.Endpoint
-		c = openai.NewClientWithConfig(conf)
-	case "openai":
-		c = openai.NewClient(vars.APIConfig.Knowledge.Key)
+
+	// releaseControl stops the "thinking" animation and hands behavior
+	// control back to the robot. Safe to call more than once.
+	var releaseOnce sync.Once
+	releaseControl := func() {
+		releaseOnce.Do(func() {
+			stopSearching()
+			searchingStopped.Wait()
+			select {
+			case stop <- true:
+			default:
+			}
+		})
 	}
-	speakReady := make(chan string)
-	successIntent := make(chan bool)
 
-	aireq := CreateAIReq(transcribedText, esn, false, isKG)
-
-	stream, err := c.CreateChatCompletionStream(ctx, aireq)
+	conf, aireq := CreateAIReq(transcribedText, esn, isKG)
+	stream, err := conf.Stream(ctx, aireq)
 	if err != nil {
 		log.Printf("Error creating chat completion stream: %v", err)
-		if strings.Contains(err.Error(), "does not exist") && vars.APIConfig.Knowledge.Provider == "openai" {
-			logger.Println("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
-			logger.LogUI("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
-			aireq := CreateAIReq(transcribedText, esn, true, isKG)
-			logger.Println("Falling back to " + aireq.Model)
-			logger.LogUI("Falling back to " + aireq.Model)
-			stream, err = c.CreateChatCompletionStream(ctx, aireq)
-			if err != nil {
-				logger.Println("OpenAI still not returning a response even after falling back. Erroring.")
-				return "", err
-			}
-		} else {
-			if isKG {
-				kgStopLooping = true
-				for range kgReadyToAnswer {
-					break
-				}
-				stop <- true
-				time.Sleep(time.Second / 3)
-				KGSim(esn, "There was an error getting data from the L. L. M.")
-			}
-			return "", err
+		logger.Println("LLM error: " + err.Error())
+		logger.LogUI("LLM error: " + err.Error())
+		if isKG {
+			releaseControl()
+			time.Sleep(time.Second / 3)
+			KGSim(esn, "There was an error getting data from the L. L. M.")
 		}
+		return "", err
 	}
-	nChat := aireq.Messages
-	nChat = append(nChat, openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleAssistant,
-	})
-	fmt.Println("LLM stream response: ")
+
+	segments, fullText := streamSegments(stream)
+
+	// Wait for the first speakable segment before taking over the robot.
+	firstSegment, gotSegment := <-segments
+	if !gotSegment {
+		logger.Println("LLM returned no response")
+		logger.LogUI("LLM returned no response for " + esn)
+		if isKG {
+			releaseControl()
+			time.Sleep(time.Second / 3)
+			KGSim(esn, "There was an error getting data from the L. L. M.")
+		}
+		return "", errors.New("llm returned no response")
+	}
+
+	// Log and remember the conversation once the whole response arrived.
 	go func() {
-		for {
-			response, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
-				// prevents a crash
-				if len(fullRespSlice) == 0 {
-					logger.Println("LLM returned no response")
-					successIntent <- false
-					if isKG {
-						kgStopLooping = true
-						for range kgReadyToAnswer {
-							break
-						}
-						stop <- true
-						time.Sleep(time.Second / 3)
-						KGSim(esn, "There was an error getting data from the L. L. M.")
-					}
-					break
-				}
-				isDone = true
-				// if fullRespSlice != fullRespText, add that missing bit to fullRespSlice
-				newStr := fullRespSlice[0]
-				for i, str := range fullRespSlice {
-					if i == 0 {
-						continue
-					}
-					newStr = newStr + " " + str
-				}
-				if strings.TrimSpace(newStr) != strings.TrimSpace(fullfullRespText) {
-					logger.Println("LLM debug: there is content after the last punctuation mark")
-					extraBit := strings.TrimPrefix(fullRespText, newStr)
-					fullRespSlice = append(fullRespSlice, extraBit)
-				}
-				if vars.APIConfig.Knowledge.SaveChat {
-					Remember(openai.ChatCompletionMessage{
-						Role:    openai.ChatMessageRoleUser,
-						Content: transcribedText,
-					},
-						openai.ChatCompletionMessage{
-							Role:    openai.ChatMessageRoleAssistant,
-							Content: newStr,
-						},
-						esn)
-				}
-				logger.LogUI("LLM response for " + esn + ": " + newStr)
-				logger.Println("LLM stream finished")
-				return
-			}
-
-			if err != nil {
-				logger.Println("Stream error: " + err.Error())
-				return
-			}
-
-			if len(response.Choices) == 0 {
-				logger.Println("Empty response")
-				return
-			}
-
-			fullfullRespText = fullfullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
-			fullRespText = fullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
-			if strings.Contains(fullRespText, "...") || strings.Contains(fullRespText, ".'") || strings.Contains(fullRespText, ".\"") || strings.Contains(fullRespText, ".") || strings.Contains(fullRespText, "?") || strings.Contains(fullRespText, "!") {
-				var sepStr string
-				if strings.Contains(fullRespText, "...") {
-					sepStr = "..."
-				} else if strings.Contains(fullRespText, ".'") {
-					sepStr = ".'"
-				} else if strings.Contains(fullRespText, ".\"") {
-					sepStr = ".\""
-				} else if strings.Contains(fullRespText, ".") {
-					sepStr = "."
-				} else if strings.Contains(fullRespText, "?") {
-					sepStr = "?"
-				} else if strings.Contains(fullRespText, "!") {
-					sepStr = "!"
-				}
-				splitResp := strings.Split(strings.TrimSpace(fullRespText), sepStr)
-				fullRespSlice = append(fullRespSlice, strings.TrimSpace(splitResp[0])+sepStr)
-				fullRespText = splitResp[1]
-				select {
-				case successIntent <- true:
-				default:
-				}
-				select {
-				case speakReady <- strings.TrimSpace(splitResp[0]) + sepStr:
-				default:
-				}
-			}
+		text, ok := <-fullText
+		if !ok || text == "" {
+			return
+		}
+		logger.LogUI("LLM response for " + esn + ": " + text)
+		logger.Println("LLM stream finished")
+		if vars.APIConfig.Knowledge.SaveChat {
+			Remember(
+				llm.Message{Role: llm.RoleUser, Content: transcribedText},
+				llm.Message{Role: llm.RoleAssistant, Content: text},
+				esn,
+			)
 		}
 	}()
-	for is := range successIntent {
-		if is {
-			if !isKG {
-				IntentPass(req, "intent_greeting_hello", transcribedText, map[string]string{}, false)
-			}
-			break
-		} else {
-			return "", errors.New("llm returned no response")
-		}
-	}
-	time.Sleep(time.Millisecond * 200)
+
 	if !isKG {
+		IntentPass(req, "intent_greeting_hello", transcribedText, map[string]string{}, false)
+		time.Sleep(time.Millisecond * 200)
 		BControl(robot, ctx, start, stop)
 	}
-	interrupted := false
+
+	var interrupted atomic.Bool
 	go func() {
-		interrupted = InterruptKGSimWhenTouchedOrWaked(robot, stop, stopStop)
+		interrupted.Store(InterruptKGSimWhenTouchedOrWaked(robot, stop, stopStop))
 	}()
+
 	var TTSLoopAnimation string
 	var TTSGetinAnimation string
 	if isKG {
@@ -413,119 +359,105 @@ func StreamingKGSim(req interface{}, esn string, transcribedText string, isKG bo
 		TTSGetinAnimation = "anim_getin_tts_01"
 	}
 
-	var stopTTSLoop bool
-	TTSLoopStopped := make(chan bool)
-	for range start {
-		if isKG {
-			kgStopLooping = true
-			for range kgReadyToAnswer {
-				break
-			}
-		} else {
-			time.Sleep(time.Millisecond * 300)
-		}
-		robot.Conn.PlayAnimation(
-			ctx,
-			&vectorpb.PlayAnimationRequest{
-				Animation: &vectorpb.Animation{
-					Name: TTSGetinAnimation,
-				},
-				Loops: 1,
+	// Wait for behavior control. If it is never granted, give up instead of
+	// blocking forever.
+	select {
+	case <-start:
+	case <-time.After(time.Second * 15):
+		releaseControl()
+		return "", errors.New("timed out waiting for behavior control")
+	}
+
+	if isKG {
+		stopSearching()
+		searchingStopped.Wait()
+	} else {
+		time.Sleep(time.Millisecond * 300)
+	}
+
+	robot.Conn.PlayAnimation(
+		ctx,
+		&vectorpb.PlayAnimationRequest{
+			Animation: &vectorpb.Animation{
+				Name: TTSGetinAnimation,
 			},
-		)
-		if !vars.APIConfig.Knowledge.CommandsEnable {
-			go func() {
-				for {
-					if stopTTSLoop {
-						TTSLoopStopped <- true
-						break
-					}
-					robot.Conn.PlayAnimation(
-						ctx,
-						&vectorpb.PlayAnimationRequest{
-							Animation: &vectorpb.Animation{
-								Name: TTSLoopAnimation,
-							},
-							Loops: 1,
+			Loops: 1,
+		},
+	)
+
+	ttsLoopCtx, stopTTSLoop := context.WithCancel(ctx)
+	var ttsLoopStopped sync.WaitGroup
+	if !vars.APIConfig.Knowledge.CommandsEnable {
+		ttsLoopStopped.Add(1)
+		go func() {
+			defer ttsLoopStopped.Done()
+			for {
+				select {
+				case <-ttsLoopCtx.Done():
+					return
+				default:
+				}
+				robot.Conn.PlayAnimation(
+					ctx,
+					&vectorpb.PlayAnimationRequest{
+						Animation: &vectorpb.Animation{
+							Name: TTSLoopAnimation,
 						},
-					)
-				}
-			}()
+						Loops: 1,
+					},
+				)
+			}
+		}()
+	}
+
+	convo := append([]llm.Message{}, aireq.Messages...)
+	convo = append(convo, llm.Message{Role: llm.RoleAssistant})
+
+	// Make sure the stream reader can always finish, even if speaking is
+	// interrupted, so its goroutine never leaks.
+	defer func() {
+		go func() {
+			for range segments {
+			}
+		}()
+	}()
+
+	segment := firstSegment
+	for {
+		if interrupted.Load() {
+			break
 		}
-		var disconnect bool
-		numInResp := 0
-		for {
-			respSlice := fullRespSlice
-			if len(respSlice)-1 < numInResp {
-				if !isDone {
-					logger.Println("Waiting for more content from LLM...")
-					for range speakReady {
-						respSlice = fullRespSlice
-						break
-					}
-				} else {
-					break
-				}
-			}
-			if interrupted {
-				break
-			}
-			logger.Println(respSlice[numInResp])
-			acts := GetActionsFromString(respSlice[numInResp])
-			nChat[len(nChat)-1].Content = fullRespText
-			disconnect = PerformActions(nChat, acts, robot, stopStop)
-			if disconnect {
-				break
-			}
-			numInResp = numInResp + 1
+		logger.Println(segment)
+		convo[len(convo)-1].Content = strings.TrimSpace(convo[len(convo)-1].Content + " " + segment)
+		if PerformActions(convo, GetActionsFromString(segment), robot, stopStop) {
+			break
 		}
-		if !vars.APIConfig.Knowledge.CommandsEnable {
-			stopTTSLoop = true
-			for range TTSLoopStopped {
-				break
-			}
+		next, ok := <-segments
+		if !ok {
+			break
 		}
-		time.Sleep(time.Millisecond * 100)
-		// if isKG {
-		// 	robot.Conn.PlayAnimation(
-		// 		ctx,
-		// 		&vectorpb.PlayAnimationRequest{
-		// 			Animation: &vectorpb.Animation{
-		// 				Name: "anim_knowledgegraph_success_01",
-		// 			},
-		// 			Loops: 1,
-		// 		},
-		// 	)
-		// 	time.Sleep(time.Millisecond * 3300)
-		// }
-		if !interrupted {
-			stopStop <- true
-			stop <- true
+		segment = next
+	}
+
+	stopTTSLoop()
+	ttsLoopStopped.Wait()
+	time.Sleep(time.Millisecond * 100)
+
+	if !interrupted.Load() {
+		select {
+		case stopStop <- true:
+		default:
 		}
 	}
+	releaseControl()
 	return "", nil
 }
 
 func KGSim(esn string, textToSay string) error {
 	ctx := context.Background()
-	matched := false
-	var robot *vector.Vector
-	var guid string
-	var target string
-	for _, bot := range vars.BotInfo.Robots {
-		if esn == bot.Esn {
-			guid = bot.GUID
-			target = bot.IPAddress + ":443"
-			matched = true
-			break
-		}
-	}
-	if matched {
-		var err error
-		robot, err = vector.New(vector.WithSerialNo(esn), vector.WithToken(guid), vector.WithTarget(target))
-		if err != nil {
-			return err
-		}
+	robot, err := getRobot(esn)
+	if err != nil {
+		return err
 	}
 	controlRequest := &vectorpb.BehaviorControlRequest{
 		RequestType: &vectorpb.BehaviorControlRequest_ControlRequest{
@@ -535,8 +467,8 @@ func KGSim(esn string, textToSay string) error {
 		},
 	}
 	go func() {
-		start := make(chan bool)
-		stop := make(chan bool)
+		start := make(chan bool, 1)
+		stop := make(chan bool, 1)
 
 		go func() {
 			// * begin - modified from official vector-go-sdk
@@ -565,85 +497,78 @@ func KGSim(esn string, textToSay string) error {
 				}
 			}
 
-			for {
-				select {
-				case <-stop:
-					logger.Println("KGSim: releasing behavior control (interrupt)")
-					if err := r.Send(
-						&vectorpb.BehaviorControlRequest{
-							RequestType: &vectorpb.BehaviorControlRequest_ControlRelease{
-								ControlRelease: &vectorpb.ControlRelease{},
-							},
-						},
-					); err != nil {
-						log.Println(err)
-						return
-					}
-					return
-				default:
-					continue
-				}
+			<-stop
+			logger.Println("KGSim: releasing behavior control")
+			if err := r.Send(
+				&vectorpb.BehaviorControlRequest{
+					RequestType: &vectorpb.BehaviorControlRequest_ControlRelease{
+						ControlRelease: &vectorpb.ControlRelease{},
+					},
+				},
+			); err != nil {
+				log.Println(err)
 			}
 			// * end - modified from official vector-go-sdk
 		}()
 
-		var stopTTSLoop bool
-		var TTSLoopStopped bool
-		for range start {
-			time.Sleep(time.Millisecond * 300)
-			robot.Conn.PlayAnimation(
-				ctx,
-				&vectorpb.PlayAnimationRequest{
-					Animation: &vectorpb.Animation{
-						Name: "anim_getin_tts_01",
-					},
-					Loops: 1,
+		select {
+		case <-start:
+		case <-time.After(time.Second * 15):
+			logger.Println("KGSim: timed out waiting for behavior control")
+			return
+		}
+		time.Sleep(time.Millisecond * 300)
+		robot.Conn.PlayAnimation(
+			ctx,
+			&vectorpb.PlayAnimationRequest{
+				Animation: &vectorpb.Animation{
+					Name: "anim_getin_tts_01",
 				},
-			)
-			go func() {
-				for {
-					if stopTTSLoop {
-						TTSLoopStopped = true
-						break
-					}
-					robot.Conn.PlayAnimation(
-						ctx,
-						&vectorpb.PlayAnimationRequest{
-							Animation: &vectorpb.Animation{
-								Name: "anim_tts_loop_02",
-							},
-							Loops: 1,
-						},
-					)
+				Loops: 1,
+			},
+		)
+		ttsLoopCtx, stopTTSLoop := context.WithCancel(ctx)
+		var ttsLoopStopped sync.WaitGroup
+		ttsLoopStopped.Add(1)
+		go func() {
+			defer ttsLoopStopped.Done()
+			for {
+				select {
+				case <-ttsLoopCtx.Done():
+					return
+				default:
 				}
-			}()
-			textToSaySplit := strings.Split(textToSay, ". ")
-			for _, str := range textToSaySplit {
-				_, err := robot.Conn.SayText(
+				robot.Conn.PlayAnimation(
 					ctx,
-					&vectorpb.SayTextRequest{
-						Text:           str + ".",
-						UseVectorVoice: true,
-						DurationScalar: 1.0,
+					&vectorpb.PlayAnimationRequest{
+						Animation: &vectorpb.Animation{
+							Name: "anim_tts_loop_02",
+						},
+						Loops: 1,
 					},
 				)
-				if err != nil {
-					logger.Println("KG SayText error: " + err.Error())
-					stop <- true
-					break
-				}
 			}
-			stopTTSLoop = true
-			for {
-				if TTSLoopStopped {
-					break
-				} else {
-					time.Sleep(time.Millisecond * 10)
-				}
+		}()
+		for _, str := range strings.Split(textToSay, ". ") {
+			_, err := robot.Conn.SayText(
+				ctx,
+				&vectorpb.SayTextRequest{
+					Text:           str + ".",
+					UseVectorVoice: true,
+					DurationScalar: 1.0,
+				},
+			)
+			if err != nil {
+				logger.Println("KG SayText error: " + err.Error())
+				break
 			}
-			time.Sleep(time.Millisecond * 100)
-			//time.Sleep(time.Millisecond * 3300)
-			stop <- true
+		}
+		stopTTSLoop()
+		ttsLoopStopped.Wait()
+		time.Sleep(time.Millisecond * 100)
+		select {
+		case stop <- true:
+		default:
 		}
 	}()
 	return nil

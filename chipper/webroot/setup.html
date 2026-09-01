@@ -136,8 +136,8 @@
             </span>
 
             <span id="customAIInput" style="display: none">
-              <small class="desc">All LLM hosts that have OpenAI API compatibility are supported. For advanced
-                users.</small><br />
+              <small class="desc">All LLM hosts which speak the OpenAI, Anthropic or Google Gemini API are supported.
+                For advanced users.</small><br />
               <label for="customKey">API Key <small class="desc">(for ollama, this is just 'ollama')</small>:</label>
               <input type="text" name="customKey" id="customKey" /><br />
               <label for="customAIEndpoint">API Endpoint <small class="desc">(i.e.
@@ -145,6 +145,13 @@
               <input type="text" name="customAIEndpoint" id="customAIEndpoint" /><br />
               <label for="customModel">LLM Model Name <small class="desc">(i.e. 'llama3')</small>:</label>
               <input type="text" name="customModel" id="customModel" /><br />
+              <label for="customAPIFormat">API Format:</label>
+              <select name="customAPIFormat" id="customAPIFormat">
+                <option value="">Auto-detect from model name</option>
+                <option value="openai">OpenAI (/chat/completions)</option>
+                <option value="anthropic">Anthropic (/messages)</option>
+                <option value="gemini">Google Gemini (generateContent)</option>
+              </select><br />
               <label for="customAIPrompt">LLM Prompt <small class="desc">(leave blank for
                   default)</small>:</label><br />
               <small><label class="desc" for="customAIPrompt">(default: "You are a helpful, animated robot called

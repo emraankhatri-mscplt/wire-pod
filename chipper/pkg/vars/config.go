@@ -34,6 +34,7 @@ type apiConfig struct {
 		SaveChat               bool    `json:"save_chat"`
 		CommandsEnable         bool    `json:"commands_enable"`
 		Endpoint               string  `json:"endpoint"`
+		APIFormat              string  `json:"api_format"`
 		TopP                   float32 `json:"top_p"`
 		Temperature            float32 `json:"temp"`
 	} `json:"knowledge"`
