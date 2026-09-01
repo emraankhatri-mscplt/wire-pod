@@ -3,17 +3,18 @@ package wirepod_ttr
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fforchino/vector-go-sdk/pkg/vector"
 	"github.com/fforchino/vector-go-sdk/pkg/vectorpb"
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
 	"github.com/kercre123/wire-pod/chipper/pkg/vars"
+	"github.com/kercre123/wire-pod/chipper/pkg/wirepod/llm"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -173,52 +174,68 @@ func CreatePrompt(origPrompt string, model string, isKG bool) string {
 	return prompt
 }
 
+// GetActionsFromString converts an LLM response segment into a list of robot
+// actions. Text outside of {{command||parameter}} blocks becomes speech.
+//
+// The parser is deliberately forgiving: models regularly drop the parameter,
+// use a single pipe, add whitespace/newlines inside the block or change the
+// capitalisation of the command. None of that may crash wire-pod or silence
+// the robot.
 func GetActionsFromString(input string) []RobotAction {
-	splitInput := strings.Split(input, "{{")
-	if len(splitInput) == 1 {
-		return []RobotAction{
-			{
-				Action:    ActionSayText,
-				Parameter: input,
-			},
-		}
-	}
 	var actions []RobotAction
-	for _, spl := range splitInput {
-		if strings.TrimSpace(spl) == "" {
-			continue
+	addSayText := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
 		}
-		if !strings.Contains(spl, "}}") {
-			// sayText
-			action := RobotAction{
-				Action:    ActionSayText,
-				Parameter: strings.TrimSpace(spl),
-			}
+		actions = append(actions, RobotAction{
+			Action:    ActionSayText,
+			Parameter: text,
+		})
+	}
+	rest := input
+	for {
+		openIdx := strings.Index(rest, "{{")
+		if openIdx == -1 {
+			addSayText(rest)
+			break
+		}
+		addSayText(rest[:openIdx])
+		afterOpen := rest[openIdx+2:]
+		closeIdx := strings.Index(afterOpen, "}}")
+		if closeIdx == -1 {
+			// unterminated block: speak whatever came after it so no
+			// content is lost
+			addSayText(strings.TrimLeft(afterOpen, "{"))
+			break
+		}
+		if action := parseCommandBlock(afterOpen[:closeIdx]); action.Action != -1 {
 			actions = append(actions, action)
-			continue
 		}
-
-		cmdPlusParam := strings.Split(strings.TrimSpace(strings.Split(spl, "}}")[0]), "||")
-		cmd := strings.TrimSpace(cmdPlusParam[0])
-		param := strings.TrimSpace(cmdPlusParam[1])
-		action := CmdParamToAction(cmd, param)
-		if action.Action != -1 {
-			actions = append(actions, action)
-		}
-		if len(strings.Split(spl, "}}")) != 1 {
-			action := RobotAction{
-				Action:    ActionSayText,
-				Parameter: strings.TrimSpace(strings.Split(spl, "}}")[1]),
-			}
-			actions = append(actions, action)
-		}
+		rest = afterOpen[closeIdx+2:]
 	}
 	return actions
 }
 
+// parseCommandBlock parses the inside of a {{ }} block.
+func parseCommandBlock(block string) RobotAction {
+	block = strings.TrimSpace(strings.ReplaceAll(block, "\n", " "))
+	var cmd, param string
+	if idx := strings.Index(block, "||"); idx != -1 {
+		cmd = block[:idx]
+		param = block[idx+2:]
+	} else if idx := strings.IndexAny(block, "|:="); idx != -1 {
+		cmd = block[:idx]
+		param = block[idx+1:]
+	} else {
+		cmd = block
+	}
+	return CmdParamToAction(strings.TrimSpace(cmd), strings.TrimSpace(param))
+}
+
 func CmdParamToAction(cmd, param string) RobotAction {
 	for _, command := range ValidLLMCommands {
-		if cmd == command.Command {
+		if strings.EqualFold(cmd, command.Command) {
 			return RobotAction{
 				Action:    command.Action,
 				Parameter: param,
@@ -288,13 +305,22 @@ func DoPlaySound(sound string, robot *vector.Vector) error {
 func DoSayText(input string, robot *vector.Vector) error {
 
 	// just before vector speaks
-	removeSpecialCharacters(input)
-
-	if (vars.APIConfig.STT.Language != "en-US" && vars.APIConfig.Knowledge.Provider == "openai") || vars.APIConfig.Knowledge.OpenAIVoiceWithEnglish {
-		err := DoSayText_OpenAI(robot, input)
-		return err
+	input = removeSpecialCharacters(input)
+	if strings.TrimSpace(input) == "" {
+		return nil
 	}
-	robot.Conn.SayText(
+
+	// OpenAI TTS always talks to api.openai.com, so it can only be used when
+	// the configured key is an OpenAI key.
+	if vars.APIConfig.Knowledge.Provider == "openai" &&
+		(vars.APIConfig.STT.Language != "en-US" || vars.APIConfig.Knowledge.OpenAIVoiceWithEnglish) {
+		if err := DoSayText_OpenAI(robot, input); err != nil {
+			logger.Println("OpenAI voice failed, falling back to Vector's voice: " + err.Error())
+		} else {
+			return nil
+		}
+	}
+	_, err := robot.Conn.SayText(
 		context.Background(),
 		&vectorpb.SayTextRequest{
 			Text:           input,
@@ -302,7 +328,10 @@ func DoSayText(input string, robot *vector.Vector) error {
 			DurationScalar: 0.95,
 		},
 	)
-	return nil
+	if err != nil {
+		logger.Println("SayText error: " + err.Error())
+	}
+	return err
 }
 
 func pcmLength(data []byte) time.Duration {
@@ -390,12 +419,16 @@ func DoSayText_OpenAI(robot *vector.Vector, input string) error {
 	return nil
 }
 
-func DoGetImage(msgs []openai.ChatCompletionMessage, param string, robot *vector.Vector, stopStop chan bool) {
+func DoGetImage(msgs []llm.Message, param string, robot *vector.Vector, stopStop chan bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	stopImaging := false
 	go func() {
-		for range stopStop {
+		select {
+		case <-stopStop:
 			stopImaging = true
-			break
+			cancel()
+		case <-ctx.Done():
 		}
 	}()
 	logger.Println("Get image here...")
@@ -420,7 +453,7 @@ func DoGetImage(msgs []openai.ChatCompletionMessage, param string, robot *vector
 			return
 		}
 	}
-	resp, _ := robot.Conn.CaptureSingleImage(
+	resp, err := robot.Conn.CaptureSingleImage(
 		context.Background(),
 		&vectorpb.CaptureSingleImageRequest{
 			EnableHighResolution: true,
@@ -432,6 +465,10 @@ func DoGetImage(msgs []openai.ChatCompletionMessage, param string, robot *vector
 			Enable: false,
 		},
 	)
+	if err != nil || resp == nil {
+		logger.Println("Couldn't get an image from the robot")
+		return
+	}
 	go func() {
 		robot.Conn.PlayAnimation(
 			context.Background(),
@@ -443,174 +480,69 @@ func DoGetImage(msgs []openai.ChatCompletionMessage, param string, robot *vector
 			},
 		)
 	}()
-	// encode to base64
-	reqBase64 := base64.StdEncoding.EncodeToString(resp.Data)
 
-	// add image to messages
-	msgs = append(msgs, openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleUser,
-		MultiContent: []openai.ChatMessagePart{
-			{
-				Type: openai.ChatMessagePartTypeImageURL,
-				ImageURL: &openai.ChatMessageImageURL{
-					URL:    fmt.Sprintf("data:image/jpeg;base64,%s", reqBase64),
-					Detail: openai.ImageURLDetailLow,
-				},
-			},
-		},
+	// add the image to the conversation. Every supported API format has its
+	// own way of carrying an image; the llm package handles that.
+	msgs = append(msgs, llm.Message{
+		Role:     llm.RoleUser,
+		ImageB64: base64.StdEncoding.EncodeToString(resp.Data),
 	})
 
-	// recreate openai
-	var fullRespText string
-	var fullfullRespText string
-	var fullRespSlice []string
-	var isDone bool
-	var c *openai.Client
-	switch vars.APIConfig.Knowledge.Provider {
-	case "together":
-		if vars.APIConfig.Knowledge.Model == "" {
-			vars.APIConfig.Knowledge.Model = "meta-llama/Llama-2-70b-chat-hf"
-			vars.WriteConfigToDisk()
-		}
-		conf := openai.DefaultConfig(vars.APIConfig.Knowledge.Key)
-		conf.BaseURL = "https://api.together.xyz/v1"
-		c = openai.NewClientWithConfig(conf)
-	case "openai":
-		c = openai.NewClient(vars.APIConfig.Knowledge.Key)
-	case "custom":
-		conf := openai.DefaultConfig(vars.APIConfig.Knowledge.Key)
-		conf.BaseURL = vars.APIConfig.Knowledge.Endpoint
-		c = openai.NewClientWithConfig(conf)
-	}
-	ctx := context.Background()
-	speakReady := make(chan string)
-
-	aireq := openai.ChatCompletionRequest{
-		MaxTokens:        2048,
-		Temperature:      1,
-		TopP:             1,
-		FrequencyPenalty: 0,
-		PresencePenalty:  0,
-		Messages:         msgs,
-		Stream:           true,
-	}
-	if vars.APIConfig.Knowledge.Provider == "openai" {
-		aireq.Model = openai.GPT4oMini
-		logger.Println("Using " + aireq.Model)
-	} else {
-		logger.Println("Using " + vars.APIConfig.Knowledge.Model)
-		aireq.Model = vars.APIConfig.Knowledge.Model
-	}
 	if stopImaging {
 		return
 	}
-	stream, err := c.CreateChatCompletionStream(ctx, aireq)
+
+	conf := LLMConfig()
+	stream, err := conf.Stream(ctx, llm.Request{
+		System:   imagePromptSystem(conf, msgs),
+		Messages: msgs,
+	})
 	if err != nil {
-		if strings.Contains(err.Error(), "does not exist") && vars.APIConfig.Knowledge.Provider == "openai" {
-			logger.Println("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
-			logger.LogUI("GPT-4 model cannot be accessed with this API key. You likely need to add more than $5 dollars of funds to your OpenAI account.")
-			aireq.Model = openai.GPT3Dot5Turbo
-			logger.Println("Falling back to " + aireq.Model)
-			logger.LogUI("Falling back to " + aireq.Model)
-			stream, err = c.CreateChatCompletionStream(ctx, aireq)
-			if err != nil {
-				logger.Println("OpenAI still not returning a response even after falling back. Erroring.")
-				return
-			}
-		} else {
-			logger.Println("LLM error: " + err.Error())
+		logger.Println("LLM error: " + err.Error())
+		logger.LogUI("LLM error: " + err.Error())
+		return
+	}
+
+	segments, fullText := streamSegments(stream)
+	go func() {
+		text, ok := <-fullText
+		if !ok || text == "" {
 			return
 		}
-	}
-	//defer stream.Close()
-
-	fmt.Println("LLM stream response: ")
-	go func() {
-		for {
-			response, err := stream.Recv()
-			if errors.Is(err, io.EOF) {
-				isDone = true
-				newStr := fullRespSlice[0]
-				for i, str := range fullRespSlice {
-					if i == 0 {
-						continue
-					}
-					newStr = newStr + " " + str
-				}
-				if strings.TrimSpace(newStr) != strings.TrimSpace(fullfullRespText) {
-					logger.Println("LLM debug: there is content after the last punctuation mark")
-					extraBit := strings.TrimPrefix(fullRespText, newStr)
-					fullRespSlice = append(fullRespSlice, extraBit)
-				}
-				if vars.APIConfig.Knowledge.SaveChat {
-					Remember(msgs[len(msgs)-1],
-						openai.ChatCompletionMessage{
-							Role:    openai.ChatMessageRoleAssistant,
-							Content: newStr,
-						},
-						robot.Cfg.SerialNo)
-				}
-				logger.LogUI("LLM response for " + robot.Cfg.SerialNo + ": " + newStr)
-				logger.Println("LLM stream finished")
-				return
-			}
-
-			if err != nil {
-				logger.Println("Stream error: " + err.Error())
-				return
-			}
-			fullfullRespText = fullfullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
-			fullRespText = fullRespText + removeSpecialCharacters(response.Choices[0].Delta.Content)
-			if strings.Contains(fullRespText, "...") || strings.Contains(fullRespText, ".'") || strings.Contains(fullRespText, ".\"") || strings.Contains(fullRespText, ".") || strings.Contains(fullRespText, "?") || strings.Contains(fullRespText, "!") {
-				var sepStr string
-				if strings.Contains(fullRespText, "...") {
-					sepStr = "..."
-				} else if strings.Contains(fullRespText, ".'") {
-					sepStr = ".'"
-				} else if strings.Contains(fullRespText, ".\"") {
-					sepStr = ".\""
-				} else if strings.Contains(fullRespText, ".") {
-					sepStr = "."
-				} else if strings.Contains(fullRespText, "?") {
-					sepStr = "?"
-				} else if strings.Contains(fullRespText, "!") {
-					sepStr = "!"
-				}
-				splitResp := strings.Split(strings.TrimSpace(fullRespText), sepStr)
-				fullRespSlice = append(fullRespSlice, strings.TrimSpace(splitResp[0])+sepStr)
-				fullRespText = splitResp[1]
-				select {
-				case speakReady <- strings.TrimSpace(splitResp[0]) + sepStr:
-				default:
-				}
-			}
+		logger.LogUI("LLM response for " + robot.Cfg.SerialNo + ": " + text)
+		logger.Println("LLM stream finished")
+		if vars.APIConfig.Knowledge.SaveChat && len(msgs) > 0 {
+			Remember(msgs[len(msgs)-1],
+				llm.Message{Role: llm.RoleAssistant, Content: text},
+				robot.Cfg.SerialNo)
 		}
 	}()
-	numInResp := 0
-	for {
+
+	for segment := range segments {
 		if stopImaging {
 			return
 		}
-		respSlice := fullRespSlice
-		if len(respSlice)-1 < numInResp {
-			if !isDone {
-				logger.Println("Waiting for more content from LLM...")
-				for range speakReady {
-					respSlice = fullRespSlice
-					break
-				}
-			} else {
-				break
-			}
-		}
-		logger.Println(respSlice[numInResp])
-		acts := GetActionsFromString(respSlice[numInResp])
-		PerformActions(msgs, acts, robot, stopStop)
-		numInResp = numInResp + 1
-		if stopImaging {
+		logger.Println(segment)
+		if PerformActions(msgs, GetActionsFromString(segment), robot, stopStop) {
 			return
 		}
 	}
+}
+
+// imagePromptSystem rebuilds the system prompt for the follow-up request which
+// analyses a freshly taken photo. The first message of a conversation is the
+// system prompt only when it was stored as such.
+func imagePromptSystem(conf llm.Config, msgs []llm.Message) string {
+	prompt := strings.TrimSpace(vars.APIConfig.Knowledge.OpenAIPrompt)
+	if prompt == "" {
+		prompt = "You are a helpful, animated robot called Vector. Keep the response concise yet informative."
+	}
+	for _, m := range msgs {
+		if m.Role == llm.RoleSystem && strings.TrimSpace(m.Content) != "" {
+			return m.Content
+		}
+	}
+	return CreatePrompt(prompt, conf.ModelName(), true)
 }
 
 func DoNewRequest(robot *vector.Vector) {
@@ -618,86 +550,51 @@ func DoNewRequest(robot *vector.Vector) {
 	robot.Conn.AppIntent(context.Background(), &vectorpb.AppIntentRequest{Intent: "knowledge_question"})
 }
 
-func PerformActions(msgs []openai.ChatCompletionMessage, actions []RobotAction, robot *vector.Vector, stopStop chan bool) bool {
+func PerformActions(msgs []llm.Message, actions []RobotAction, robot *vector.Vector, stopStop chan bool) bool {
 	// assuming we have behavior control already
+	var stopMutex sync.Mutex
 	stopPerforming := false
+	isStopped := func() bool {
+		stopMutex.Lock()
+		defer stopMutex.Unlock()
+		return stopPerforming
+	}
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		for range stopStop {
+		select {
+		case <-stopStop:
+			stopMutex.Lock()
 			stopPerforming = true
+			stopMutex.Unlock()
+		case <-done:
 		}
 	}()
 	for _, action := range actions {
-		if stopPerforming {
+		if isStopped() {
 			return false
 		}
-		switch {
-		case action.Action == ActionSayText:
+		switch action.Action {
+		case ActionSayText:
 			DoSayText(action.Parameter, robot)
-		case action.Action == ActionPlayAnimation:
+		case ActionPlayAnimation:
 			DoPlayAnimation(action.Parameter, robot)
-		case action.Action == ActionPlayAnimationWI:
+		case ActionPlayAnimationWI:
 			DoPlayAnimationWI(action.Parameter, robot)
-		case action.Action == ActionNewRequest:
+		case ActionNewRequest:
 			go DoNewRequest(robot)
 			return true
-		case action.Action == ActionGetImage:
+		case ActionGetImage:
 			DoGetImage(msgs, action.Parameter, robot, stopStop)
 			return true
-		case action.Action == ActionPlaySound:
-			DoPlaySound(action.Parameter, robot)
 		}
 	}
 	WaitForAnim_Queue(robot.Cfg.SerialNo)
 	return false
 }
 
-func WaitForAnim_Queue(esn string) {
-	for i, q := range AnimationQueues {
-		if q.ESN == esn {
-			if q.AnimCurrentlyPlaying {
-				for range AnimationQueues[i].AnimDone {
-					break
-				}
-				return
-			}
-		}
-	}
-}
-
-func StartAnim_Queue(esn string) {
-	// if animation is already playing, just wait for it to be done
-	for i, q := range AnimationQueues {
-		if q.ESN == esn {
-			if q.AnimCurrentlyPlaying {
-				for range AnimationQueues[i].AnimDone {
-					logger.Println("(waiting for animation to be done...)")
-					break
-				}
-			} else {
-				AnimationQueues[i].AnimCurrentlyPlaying = true
-			}
-			return
-		}
-	}
-	var aq AnimationQueue
-	aq.AnimCurrentlyPlaying = true
-	aq.AnimDone = make(chan bool)
-	aq.ESN = esn
-	AnimationQueues = append(AnimationQueues, aq)
-}
-
-func StopAnim_Queue(esn string) {
-	for i, q := range AnimationQueues {
-		if q.ESN == esn {
-			AnimationQueues[i].AnimCurrentlyPlaying = false
-			select {
-			case AnimationQueues[i].AnimDone <- true:
-			default:
-			}
-		}
-	}
-}
-
+// The animation queue makes sure only one animation plays at a time per robot
+// and that speech waits for a "without interrupt" animation to finish.
 type AnimationQueue struct {
 	ESN                  string
 	AnimDone             chan bool
@@ -705,3 +602,62 @@ type AnimationQueue struct {
 }
 
 var AnimationQueues []AnimationQueue
+var animationQueuesMutex sync.Mutex
+
+// animQueue returns the index of the queue for esn, creating it if needed.
+// animationQueuesMutex must be held.
+func animQueueIndex(esn string) int {
+	for i, q := range AnimationQueues {
+		if q.ESN == esn {
+			return i
+		}
+	}
+	AnimationQueues = append(AnimationQueues, AnimationQueue{
+		ESN:      esn,
+		AnimDone: make(chan bool, 1),
+	})
+	return len(AnimationQueues) - 1
+}
+
+// waitForAnimDone blocks until the currently playing animation is done, or
+// until the timeout expires so a dropped completion signal can never hang the
+// response.
+func waitForAnimDone(esn string) {
+	animationQueuesMutex.Lock()
+	i := animQueueIndex(esn)
+	if !AnimationQueues[i].AnimCurrentlyPlaying {
+		animationQueuesMutex.Unlock()
+		return
+	}
+	done := AnimationQueues[i].AnimDone
+	animationQueuesMutex.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second * 30):
+		logger.Println("(gave up waiting for an animation to finish)")
+	}
+}
+
+func WaitForAnim_Queue(esn string) {
+	waitForAnimDone(esn)
+}
+
+func StartAnim_Queue(esn string) {
+	// if an animation is already playing, wait for it to be done first
+	waitForAnimDone(esn)
+	animationQueuesMutex.Lock()
+	defer animationQueuesMutex.Unlock()
+	i := animQueueIndex(esn)
+	AnimationQueues[i].AnimCurrentlyPlaying = true
+}
+
+func StopAnim_Queue(esn string) {
+	animationQueuesMutex.Lock()
+	defer animationQueuesMutex.Unlock()
+	i := animQueueIndex(esn)
+	AnimationQueues[i].AnimCurrentlyPlaying = false
+	select {
+	case AnimationQueues[i].AnimDone <- true:
+	default:
+	}
+}
