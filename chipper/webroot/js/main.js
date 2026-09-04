@@ -502,7 +502,7 @@ function updateColor(id) {
 
 
 function showLog() {
-  toggleVisibility(["section-intents", "section-log", "section-botauth", "section-version", "section-uicustomizer"], "section-log", "icon-Logs");
+  toggleVisibility(["section-intents", "section-log", "section-botauth", "section-version", "section-uicustomizer", "section-sightwords"], "section-log", "icon-Logs");
   logDivArea = getE("botTranscriptedTextArea");
   getE("logscrollbottom").checked = true;
   logP = document.createElement("p");
@@ -591,12 +591,65 @@ function showLanguage() {
 }
 
 function showVersion() {
-  toggleVisibility(["section-log", "section-botauth", "section-intents", "section-version", "section-uicustomizer"], "section-version", "icon-Version");
+  toggleVisibility(["section-log", "section-botauth", "section-intents", "section-version", "section-uicustomizer", "section-sightwords"], "section-version", "icon-Version");
   checkUpdate();
 }
 
 function showIntents() {
-  toggleVisibility(["section-log", "section-botauth", "section-intents", "section-version", "section-uicustomizer"], "section-intents", "icon-Intents");
+  toggleVisibility(["section-log", "section-botauth", "section-intents", "section-version", "section-uicustomizer", "section-sightwords"], "section-intents", "icon-Intents");
+}
+
+function showSightWords() {
+  toggleVisibility(["section-log", "section-botauth", "section-intents", "section-version", "section-uicustomizer", "section-sightwords"], "section-sightwords", "icon-SightWords");
+  loadSightWords();
+}
+
+function loadSightWords() {
+  displayMessage("sightWordsStatus", "Loading...");
+  fetch("/api/get_sight_words")
+    .then((response) => response.json())
+    .then((config) => {
+      getE("sightWordsList").value = (config.words || []).join("\n");
+      getE("sightWordsSeconds").value = config.seconds_per_word || 4;
+      getE("sightWordsOrganicMode").checked = !!config.organic_mode;
+      displayMessage("sightWordsStatus", "");
+    })
+    .catch((error) => {
+      console.error(error);
+      displayError("sightWordsStatus", "Error fetching sight words");
+    });
+}
+
+function saveSightWords() {
+  const words = getE("sightWordsList").value
+    .split(/[\n,]/)
+    .map((word) => word.trim())
+    .filter((word) => word.length > 0);
+  const parsedSeconds = parseFloat(getE("sightWordsSeconds").value);
+  const data = {
+    words: words,
+    seconds_per_word: isNaN(parsedSeconds) ? 4 : parsedSeconds,
+    organic_mode: getE("sightWordsOrganicMode").checked,
+  };
+
+  displayMessage("sightWordsStatus", "Saving...");
+
+  fetch("/api/set_sight_words", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(data),
+  })
+    .then((response) => response.text())
+    .then((response) => {
+      displayMessage("sightWordsStatus", response);
+      loadSightWords();
+    })
+    .catch((error) => {
+      console.error(error);
+      displayError("sightWordsStatus", "Error saving sight words");
+    });
 }
 
 function showWeather() {
