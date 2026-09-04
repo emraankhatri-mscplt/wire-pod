@@ -259,7 +259,7 @@ func ProcessTextAll(req interface{}, voiceText string, intents []vars.JsonIntent
 	var successMatched bool = false
 	voiceText = strings.ToLower(voiceText)
 	if sightWordsHandler(req, voiceText, botSerial) {
-		logger.Println("This is a sight words practice command!")
+		logger.Println("Handled by sight words practice")
 		return true
 	}
 	pluginMatched := pluginFunctionHandler(req, voiceText, botSerial)

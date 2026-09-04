@@ -22,6 +22,10 @@ import (
 // how long to wait for behavior control before giving up on the session
 const sightWordsControlTimeout = time.Second * 15
 
+// screen brightness, as a percentage, used when converting a word to the
+// format Vector's screen expects
+const sightWordsOpacityPercent = 100
+
 var (
 	sightWordsMutex    sync.Mutex
 	sightWordsSessions = map[string]chan sightWordsAction{}
@@ -125,7 +129,7 @@ func (p *robotSightWordsPresenter) Clear() {
 // sightWordFaceData renders a word into the 16 bit format Vector's screen
 // expects. An empty word gives a blank screen.
 func sightWordFaceData(word string) []byte {
-	pixels := scripting.ConvertPixelsToRawBitmap(RenderSightWord(word), 100)
+	pixels := scripting.ConvertPixelsToRawBitmap(RenderSightWord(word), sightWordsOpacityPercent)
 	buf := new(bytes.Buffer)
 	for _, pixel := range pixels {
 		binary.Write(buf, binary.LittleEndian, pixel)
@@ -223,6 +227,8 @@ func sightWordsHandler(req interface{}, voiceText string, botSerial string) bool
 	}
 	logger.Println("Bot " + botSerial + " matched a sight words session command")
 	IntentPass(req, "intent_imperative_affirmative", voiceText, map[string]string{}, false)
-	sendSightWordsAction(botSerial, action)
+	if !sendSightWordsAction(botSerial, action) {
+		logger.Println("Bot " + botSerial + " sight words command could not be delivered, the session may have just ended")
+	}
 	return true
 }

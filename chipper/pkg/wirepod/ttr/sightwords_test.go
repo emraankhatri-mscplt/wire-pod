@@ -299,6 +299,7 @@ func TestSightWordsSessionRegistry(t *testing.T) {
 	if !claimed {
 		t.Fatal("the first session should be able to start")
 	}
+	defer unregisterSightWordsSession(esn)
 	if _, claimed := registerSightWordsSession(esn); claimed {
 		t.Fatal("a second session must not start while one is running")
 	}

@@ -47,6 +47,8 @@ const (
 	maxSightWords = 100
 	// longest word which can still be drawn legibly
 	maxSightWordLength = 16
+	// extra time the word stays up while it is being spoken
+	sightWordSpeechPaddingMs = 3000
 )
 
 // DefaultSightWords is the example list which is written to disk the first
@@ -273,7 +275,7 @@ func runSightWordsSession(presenter sightWordsPresenter, words []string, hold ti
 	}
 	presenter.Say(sightWordsIntro)
 	// the word stays up while it is being said as well as during the wait
-	holdMs := uint32(hold/time.Millisecond) + 3000
+	holdMs := uint32(hold/time.Millisecond) + sightWordSpeechPaddingMs
 	for i := 0; i < len(words); {
 		word := words[i]
 		if err := presenter.Show(word, holdMs); err != nil {
@@ -350,8 +352,9 @@ func matchesAnyPhrase(voiceText string, phrases []string) bool {
 
 // sightWordsCommand works out what the child asked for. sessionActive tells it
 // whether a practice session is currently running on that robot, since "next
-// word" only means something during a session.
-func sightWordsCommand(voiceText string, sessionActive bool) (sightWordsAction, bool, bool) {
+// word" only means something during a session. action is only meaningful when
+// matched is true and isStart is false.
+func sightWordsCommand(voiceText string, sessionActive bool) (action sightWordsAction, isStart bool, matched bool) {
 	voiceText = strings.ToLower(strings.TrimSpace(voiceText))
 	if sessionActive {
 		if matchesAnyPhrase(voiceText, sightWordsStopPhrases) {
