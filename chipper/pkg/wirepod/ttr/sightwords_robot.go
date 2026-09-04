@@ -354,38 +354,13 @@ func StartOrganicSightWords(esn string) {
 		},
 	}
 
-	organicSightWordsMutex.Lock()
-	organicSightWordsSessions[esn] = session
-	organicSightWordsMutex.Unlock()
-
-	session.idleTimer = time.AfterFunc(organicSightWordsIdleTimeout, func() {
-		logger.Println("sight words: organic conversation with " + esn + " timed out")
-		endOrganicSightWords(esn)
-	})
-
-	// the shared session registry is only used here to detect "stop sight
-	// words" and to know a session is active; next/repeat don't apply to an
-	// organic conversation and are ignored.
-	go func() {
-		for {
-			select {
-			case action, ok := <-actions:
-				if !ok {
-					return
-				}
-				if action == sightWordsStop {
-					endOrganicSightWords(esn)
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	logger.Println("sight words: starting organic practice on " + esn + " with " + strconv.Itoa(len(config.Words)) + " words")
 	logger.LogUI("Organic sight words practice started on " + esn)
 
+	// The opening reply is generated before the session is registered, so
+	// that if the child speaks before it comes back, ContinueOrganicSightWords
+	// (which requires a registered session) can't run ahead of it and get the
+	// conversation history out of order.
 	reply, err := session.conf.Complete(ctx, llm.Request{
 		System: organicSightWordsSystemPrompt(session.state.remaining()),
 	})
@@ -396,7 +371,10 @@ func StartOrganicSightWords(esn string) {
 			logger.Println("sight words: organic opening returned no text")
 		}
 		session.presenter.Say(sightWordsOrganicLLMError)
-		endOrganicSightWords(esn)
+		session.presenter.Clear()
+		unregisterSightWordsSession(esn)
+		cancel()
+		session.releaseControl()
 		return
 	}
 
@@ -406,10 +384,48 @@ func StartOrganicSightWords(esn string) {
 	done := session.state.allCovered()
 	session.mu.Unlock()
 
+	if !done {
+		// Only now, with the opening reply already recorded, does the
+		// session accept further turns: registering any earlier would let
+		// ContinueOrganicSightWords race ahead of this reply and record the
+		// child's turn before Vector's opening line.
+		organicSightWordsMutex.Lock()
+		organicSightWordsSessions[esn] = session
+		organicSightWordsMutex.Unlock()
+
+		session.idleTimer = time.AfterFunc(organicSightWordsIdleTimeout, func() {
+			logger.Println("sight words: organic conversation with " + esn + " timed out")
+			endOrganicSightWords(esn)
+		})
+
+		// the shared session registry is only used here to detect "stop
+		// sight words" and to know a session is active; next/repeat don't
+		// apply to an organic conversation and are ignored.
+		go func() {
+			for {
+				select {
+				case action, ok := <-actions:
+					if !ok {
+						return
+					}
+					if action == sightWordsStop {
+						endOrganicSightWords(esn)
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	session.presenter.Say(reply)
 	if done {
 		session.presenter.Say(sightWordsOrganicDone)
-		endOrganicSightWords(esn)
+		session.presenter.Clear()
+		unregisterSightWordsSession(esn)
+		cancel()
+		session.releaseControl()
 	}
 }
 

@@ -625,9 +625,10 @@ function saveSightWords() {
     .split(/[\n,]/)
     .map((word) => word.trim())
     .filter((word) => word.length > 0);
+  const parsedSeconds = parseFloat(getE("sightWordsSeconds").value);
   const data = {
     words: words,
-    seconds_per_word: parseFloat(getE("sightWordsSeconds").value) || 4,
+    seconds_per_word: isNaN(parsedSeconds) ? 4 : parsedSeconds,
     organic_mode: getE("sightWordsOrganicMode").checked,
   };
 
