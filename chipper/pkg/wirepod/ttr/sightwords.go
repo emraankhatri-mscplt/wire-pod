@@ -59,12 +59,21 @@ const (
 	sightWordsDone      = "Great job! That's all the words."
 	sightWordsStopped   = "Okay, we can practice later. Great job!"
 	sightWordsEmptyList = "I don't have any sight words yet. Please add some words to my sight words list."
+
+	// organic (LLM conversation) mode phrases
+	sightWordsOrganicDone     = "Great job! We practiced all the sight words."
+	sightWordsOrganicLLMError = "I couldn't think of anything to say. Let's try practicing sight words again later."
 )
 
 // SightWordsConfig is the on-disk sight words configuration.
 type SightWordsConfig struct {
 	Words          []string `json:"words"`
 	SecondsPerWord float64  `json:"seconds_per_word"`
+	// OrganicMode, when true, has the robot weave the active sight words
+	// into a natural LLM-driven conversation instead of the rigid
+	// show/say/hold-per-word sequence. Defaults to false so existing
+	// configuration files keep behaving exactly as before.
+	OrganicMode bool `json:"organic_mode"`
 }
 
 // HoldTime is how long each word should stay on the screen.
@@ -159,11 +168,8 @@ func LoadSightWords() SightWordsConfig {
 			Words:          DefaultSightWords,
 			SecondsPerWord: defaultSightWordSeconds,
 		}
-		writeBytes, err := json.MarshalIndent(config, "", "  ")
-		if err == nil {
-			if err := os.WriteFile(vars.SightWordsPath, writeBytes, 0644); err != nil {
-				logger.Println("sight words: unable to write example list: " + err.Error())
-			}
+		if err := SaveSightWordsConfig(config); err != nil {
+			logger.Println("sight words: unable to write example list: " + err.Error())
 		}
 		return config
 	}
@@ -174,6 +180,20 @@ func LoadSightWords() SightWordsConfig {
 		return SightWordsConfig{}
 	}
 	return config
+}
+
+// SaveSightWordsConfig sanitizes and writes a sight words configuration to
+// vars.SightWordsPath, in the full object form which ParseSightWordsConfig
+// reads back unchanged. This is the only place which should write the file,
+// so the web UI and the first-run default share the same validation that
+// ParseSightWordsConfig applies when reading.
+func SaveSightWordsConfig(config SightWordsConfig) error {
+	config.Words = sanitizeSightWords(config.Words)
+	writeBytes, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(vars.SightWordsPath, writeBytes, 0644)
 }
 
 // RenderSightWord draws one word, white on black, as large as will fit on
@@ -373,4 +393,100 @@ func sightWordsCommand(voiceText string, sessionActive bool) (action sightWordsA
 		return sightWordsTimeout, true, true
 	}
 	return sightWordsTimeout, false, false
+}
+
+// Organic mode: instead of the rigid show/say/hold sequence above, the LLM is
+// given the active sight words and asked to weave them into a short, natural
+// conversation. organicSightWordsState tracks which of the active words have
+// come up (said by either Vector or the child) so a session knows when it is
+// done. The actual robot/LLM plumbing lives in sightwords_robot.go, which
+// keeps this logic reusable and independently testable.
+
+// organicSightWordsIdleTimeout is how long an organic session waits for the
+// child's next reply before giving up and ending on its own.
+const organicSightWordsIdleTimeout = 3 * time.Minute
+
+// organicSightWordsState tracks progress through the active word list during
+// one organic conversation.
+type organicSightWordsState struct {
+	words   []string
+	covered map[string]bool
+}
+
+// newOrganicSightWordsState starts tracking a fresh conversation over words.
+func newOrganicSightWordsState(words []string) *organicSightWordsState {
+	return &organicSightWordsState{words: words, covered: map[string]bool{}}
+}
+
+// markSpoken looks for any not-yet-covered active word in text (said by
+// either Vector or the child) and marks it covered.
+func (s *organicSightWordsState) markSpoken(text string) {
+	lower := strings.ToLower(text)
+	for _, word := range s.words {
+		if s.covered[word] {
+			continue
+		}
+		if containsSightWord(lower, strings.ToLower(word)) {
+			s.covered[word] = true
+		}
+	}
+}
+
+// remaining is the active words which haven't come up yet, in list order.
+func (s *organicSightWordsState) remaining() []string {
+	var out []string
+	for _, word := range s.words {
+		if !s.covered[word] {
+			out = append(out, word)
+		}
+	}
+	return out
+}
+
+// allCovered reports whether every active word has come up at least once.
+func (s *organicSightWordsState) allCovered() bool {
+	return len(s.remaining()) == 0
+}
+
+// containsSightWord reports whether word appears in text as a standalone
+// word, so "is" does not match inside "this".
+func containsSightWord(text, word string) bool {
+	if word == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(text[start:], word)
+		if i < 0 {
+			return false
+		}
+		matchStart := start + i
+		matchEnd := matchStart + len(word)
+		beforeOK := matchStart == 0 || !isSightWordBoundaryRune(rune(text[matchStart-1]))
+		afterOK := matchEnd >= len(text) || !isSightWordBoundaryRune(rune(text[matchEnd]))
+		if beforeOK && afterOK {
+			return true
+		}
+		start = matchStart + 1
+	}
+}
+
+func isSightWordBoundaryRune(r rune) bool {
+	return unicode.IsLetter(r) || r == '\'' || r == '-'
+}
+
+// organicSightWordsSystemPrompt builds the LLM system prompt which asks it to
+// practice the given remaining active words with the child through natural
+// conversation rather than a rigid drill.
+func organicSightWordsSystemPrompt(remaining []string) string {
+	return "You are Vector, a friendly small robot helping a young child practice reading sight words " +
+		"through natural conversation, not a rigid drill. " +
+		"The child's active sight words to practice right now are: " + strings.Join(remaining, ", ") + ". " +
+		"Weave these words naturally into a short, warm back-and-forth conversation, such as asking simple " +
+		"questions, telling a tiny story, or playing a word game, so that by the end the child has said or " +
+		"read each listed word out loud at least once. " +
+		"Keep every reply to one or two short, simple sentences suitable for a young child, and end most " +
+		"replies with a question or prompt that invites the child to respond and say one of the words. " +
+		"Do not simply read the words out as a list, and do not mention that this is a lesson or a test. " +
+		"Once you believe the child has practiced every listed word, congratulate them and let them know " +
+		"practice is complete."
 }

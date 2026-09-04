@@ -4,9 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"image/color"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kercre123/wire-pod/chipper/pkg/vars"
 )
 
 // The full object form of the config must be read as-is.
@@ -20,6 +24,44 @@ func TestParseSightWordsConfigObject(t *testing.T) {
 	}
 	if config.HoldTime() != time.Second*6 {
 		t.Fatalf("wrong hold time: %v", config.HoldTime())
+	}
+	if config.OrganicMode {
+		t.Fatal("organic mode should default to false when not present in the config")
+	}
+}
+
+// OrganicMode is a new field; existing configs without it must keep behaving
+// exactly as before (rigid mode).
+func TestParseSightWordsConfigOrganicModeDefaultsFalse(t *testing.T) {
+	config, err := ParseSightWordsConfig([]byte(`{"words": ["the", "and"]}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.OrganicMode {
+		t.Fatal("organic mode should default to false for backward compatibility")
+	}
+}
+
+// The object form must be able to turn organic mode on.
+func TestParseSightWordsConfigOrganicModeEnabled(t *testing.T) {
+	config, err := ParseSightWordsConfig([]byte(`{"words": ["the", "and"], "organic_mode": true}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !config.OrganicMode {
+		t.Fatal("organic mode should be enabled")
+	}
+}
+
+// The bare list form has no way to express organic mode, so it must default
+// to false (rigid mode), same as an object form which omits the field.
+func TestParseSightWordsConfigBareListOrganicModeDefault(t *testing.T) {
+	config, err := ParseSightWordsConfig([]byte(`["the", "and"]`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.OrganicMode {
+		t.Fatal("bare list form should never enable organic mode")
 	}
 }
 
@@ -342,5 +384,77 @@ func TestSightWordsSessionRegistry(t *testing.T) {
 	}
 	if sendSightWordsAction(esn, sightWordsStop) {
 		t.Fatal("commands must not be accepted with no session running")
+	}
+}
+
+// SaveSightWordsConfig must write a config which ParseSightWordsConfig reads
+// back unchanged (aside from sanitization), including the organic mode flag,
+// and it must sanitize the word list before writing.
+func TestSaveSightWordsConfigRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := vars.SightWordsPath
+	vars.SightWordsPath = filepath.Join(dir, "sightWords.json")
+	defer func() { vars.SightWordsPath = oldPath }()
+
+	toSave := SightWordsConfig{
+		Words:          []string{"the", "1234", "well-known"},
+		SecondsPerWord: 7,
+		OrganicMode:    true,
+	}
+	if err := SaveSightWordsConfig(toSave); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	written, err := os.ReadFile(vars.SightWordsPath)
+	if err != nil {
+		t.Fatalf("config file was not written: %v", err)
+	}
+	config, err := ParseSightWordsConfig(written)
+	if err != nil {
+		t.Fatalf("written config could not be parsed back: %v", err)
+	}
+	if strings.Join(config.Words, ",") != "the,well-known" {
+		t.Fatalf("wrong words after save/load round trip: %v", config.Words)
+	}
+	if config.HoldTime() != time.Second*7 {
+		t.Fatalf("wrong hold time after round trip: %v", config.HoldTime())
+	}
+	if !config.OrganicMode {
+		t.Fatal("organic mode should have been preserved")
+	}
+}
+
+// A fresh organic session must not consider any word covered.
+func TestOrganicSightWordsStateStartsUncovered(t *testing.T) {
+	state := newOrganicSightWordsState([]string{"the", "and", "see"})
+	if state.allCovered() {
+		t.Fatal("a fresh session should not be fully covered")
+	}
+	if strings.Join(state.remaining(), ",") != "the,and,see" {
+		t.Fatalf("wrong remaining words: %v", state.remaining())
+	}
+}
+
+// Words are marked covered whether they're said by Vector or the child, are
+// matched case-insensitively, and only as whole words.
+func TestOrganicSightWordsStateMarksSpokenWords(t *testing.T) {
+	state := newOrganicSightWordsState([]string{"the", "see", "is"})
+	state.markSpoken("The dog wants to see you!")
+	if strings.Join(state.remaining(), ",") != "is" {
+		t.Fatalf("wrong remaining words: %v", state.remaining())
+	}
+	// "is" appears inside "this", which must not count.
+	state.markSpoken("this is fun")
+	if !state.allCovered() {
+		t.Fatalf("expected every word to be covered, remaining: %v", state.remaining())
+	}
+}
+
+// The system prompt must mention every remaining word so the LLM knows what
+// to practice.
+func TestOrganicSightWordsSystemPromptListsRemainingWords(t *testing.T) {
+	prompt := organicSightWordsSystemPrompt([]string{"the", "and"})
+	if !strings.Contains(prompt, "the, and") {
+		t.Fatalf("prompt should list the remaining words: %s", prompt)
 	}
 }

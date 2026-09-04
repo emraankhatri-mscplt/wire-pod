@@ -42,6 +42,11 @@
           <a href="#" onclick="showIntents(); return false;"><i class="fa-solid fa-microphone-lines" id="icon-Intents"
               name="icon"></i><br />Custom Intents</a>
         </div>
+        <!--Sight Words-->
+        <div class="main-nav-child">
+          <a href="#" onclick="showSightWords(); return false;"><i class="fa-solid fa-book-open-reader" id="icon-SightWords"
+              name="icon"></i><br />Sight Words</a>
+        </div>
         <!--Logs-->
         <div class="main-nav-child">
           <a href="#" onclick="showLog(); return false;"><i class="fa-solid fa-file-lines" id="icon-Logs"
@@ -117,6 +122,30 @@
           <div id="editIntentForm"></div>
           <hr />
         </div>
+      </div>
+
+      <div id="section-sightwords" style="display: none">
+        <h2>Sight Words</h2>
+        <hr class="small-hr">
+        <p>
+          Vector can practice these words with the child, either in the
+          rigid show/say/hold sequence or, if enabled below, by chatting
+          about them naturally with the help of the configured LLM. See
+          <a href="https://github.com/kercre123/wire-pod/blob/main/docs/sight-words.md" target="_blank">the sight
+            words docs</a> for details.
+        </p>
+        <div id="sightWordsStatus"></div>
+        <label for="sightWordsList">Active sight words (one per line, or separated by commas):</label><br />
+        <textarea id="sightWordsList" rows="8" cols="40"></textarea><br />
+        <label for="sightWordsSeconds">Seconds each word stays on the screen (1-30):</label>
+        <input type="number" id="sightWordsSeconds" name="sightWordsSeconds" min="1" max="30" step="1" /><br />
+        <input type="checkbox" id="sightWordsOrganicMode" name="sightWordsOrganicMode" />
+        <label class="checkbox-label" for="sightWordsOrganicMode">
+          Practice organically: have Vector chat about the words using the
+          configured LLM instead of the rigid show/say/hold sequence
+        </label><br />
+        <button onclick="saveSightWords()">Save sight words</button>
+        <hr />
       </div>
 
       <div id="section-botauth" style="display: none">

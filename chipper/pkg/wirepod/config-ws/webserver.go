@@ -18,6 +18,7 @@ import (
 	"github.com/kercre123/wire-pod/chipper/pkg/wirepod/localization"
 	processreqs "github.com/kercre123/wire-pod/chipper/pkg/wirepod/preqs"
 	botsetup "github.com/kercre123/wire-pod/chipper/pkg/wirepod/setup"
+	wirepod_ttr "github.com/kercre123/wire-pod/chipper/pkg/wirepod/ttr"
 )
 
 var SttInitFunc func() error
@@ -65,6 +66,10 @@ func apiHandler(w http.ResponseWriter, r *http.Request) {
 		handleGetVersionInfo(w)
 	case "generate_certs":
 		handleGenerateCerts(w)
+	case "get_sight_words":
+		handleGetSightWords(w)
+	case "set_sight_words":
+		handleSetSightWords(w, r)
 	case "is_api_v3":
 		fmt.Fprintf(w, "it is!")
 	default:
@@ -175,6 +180,35 @@ func handleRemoveCustomIntent(w http.ResponseWriter, r *http.Request) {
 	vars.CustomIntents = append(vars.CustomIntents[:request.Number-1], vars.CustomIntents[request.Number:]...)
 	saveCustomIntents()
 	fmt.Fprint(w, "Intent removed successfully.")
+}
+
+// handleGetSightWords returns the current sight words configuration (active
+// word list, seconds per word and whether organic/LLM conversation mode is
+// enabled) so the web UI can be pre-filled with it.
+func handleGetSightWords(w http.ResponseWriter) {
+	config := wirepod_ttr.LoadSightWords()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(config); err != nil {
+		http.Error(w, "could not encode sight words config", http.StatusInternalServerError)
+		logger.Println(err)
+	}
+}
+
+// handleSetSightWords saves a new sight words configuration from the web UI.
+// It goes through wirepod_ttr.SaveSightWordsConfig so the same word
+// validation/sanitization used everywhere else (sightwords.go) is applied.
+func handleSetSightWords(w http.ResponseWriter, r *http.Request) {
+	var config wirepod_ttr.SightWordsConfig
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := wirepod_ttr.SaveSightWordsConfig(config); err != nil {
+		http.Error(w, "could not save sight words config: "+err.Error(), http.StatusInternalServerError)
+		logger.Println(err)
+		return
+	}
+	fmt.Fprint(w, "Sight words saved successfully.")
 }
 
 func handleSetWeatherAPI(w http.ResponseWriter, r *http.Request) {

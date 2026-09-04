@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/fforchino/vector-go-sdk/pkg/vectorpb"
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
 	"github.com/kercre123/wire-pod/chipper/pkg/scripting"
+	"github.com/kercre123/wire-pod/chipper/pkg/wirepod/llm"
 )
 
 // how long to wait for behavior control before giving up on the session
@@ -211,6 +213,18 @@ func StartSightWords(esn string) error {
 // commands. It is checked alongside plugins and custom intents in
 // ProcessTextAll, and returns true when it took the utterance.
 func sightWordsHandler(req interface{}, voiceText string, botSerial string) bool {
+	if OrganicSightWordsSessionActive(botSerial) {
+		if matchesAnyPhrase(strings.ToLower(strings.TrimSpace(voiceText)), sightWordsStopPhrases) {
+			logger.Println("Bot " + botSerial + " stopped an organic sight words conversation")
+			IntentPass(req, "intent_imperative_affirmative", voiceText, map[string]string{}, false)
+			stopOrganicSightWords(botSerial)
+			return true
+		}
+		logger.Println("Bot " + botSerial + " continuing an organic sight words conversation")
+		IntentPass(req, "intent_greeting_hello", voiceText, map[string]string{}, false)
+		go ContinueOrganicSightWords(botSerial, voiceText)
+		return true
+	}
 	action, isStart, matched := sightWordsCommand(voiceText, SightWordsSessionActive(botSerial))
 	if !matched {
 		return false
@@ -218,10 +232,15 @@ func sightWordsHandler(req interface{}, voiceText string, botSerial string) bool
 	if isStart {
 		logger.Println("Bot " + botSerial + " matched sight words practice")
 		IntentPass(req, "intent_greeting_hello", voiceText, map[string]string{}, false)
+		organic := LoadSightWords().OrganicMode
 		go func() {
 			// the robot needs a moment to finish reacting to the intent
 			time.Sleep(time.Millisecond * 200)
-			StartSightWords(botSerial)
+			if organic {
+				StartOrganicSightWords(botSerial)
+			} else {
+				StartSightWords(botSerial)
+			}
 		}()
 		return true
 	}
@@ -231,4 +250,252 @@ func sightWordsHandler(req interface{}, voiceText string, botSerial string) bool
 		logger.Println("Bot " + botSerial + " sight words command could not be delivered, the session may have just ended")
 	}
 	return true
+}
+
+// organicSightWordsSession is the state for one robot's organic (LLM
+// conversation) sight words practice session. Unlike a rigid session, which
+// runs start to finish inside StartSightWords, an organic session is spread
+// across several calls: StartOrganicSightWords begins it and each further
+// utterance from the child is delivered through ContinueOrganicSightWords.
+type organicSightWordsSession struct {
+	mu             sync.Mutex
+	presenter      *robotSightWordsPresenter
+	state          *organicSightWordsState
+	conf           llm.Config
+	messages       []llm.Message
+	ctx            context.Context
+	cancel         context.CancelFunc
+	releaseControl func()
+	idleTimer      *time.Timer
+}
+
+var (
+	organicSightWordsMutex    sync.Mutex
+	organicSightWordsSessions = map[string]*organicSightWordsSession{}
+)
+
+// OrganicSightWordsSessionActive reports whether the given robot is in the
+// middle of an organic sight words conversation.
+func OrganicSightWordsSessionActive(esn string) bool {
+	organicSightWordsMutex.Lock()
+	defer organicSightWordsMutex.Unlock()
+	_, exists := organicSightWordsSessions[esn]
+	return exists
+}
+
+func getOrganicSightWordsSession(esn string) (*organicSightWordsSession, bool) {
+	organicSightWordsMutex.Lock()
+	defer organicSightWordsMutex.Unlock()
+	session, exists := organicSightWordsSessions[esn]
+	return session, exists
+}
+
+// StartOrganicSightWords begins one organic sight words conversation on the
+// given robot: it grants Vector behavior control, asks the LLM for an opening
+// line which weaves in the active sight words, and says it. Further turns of
+// the conversation arrive via ContinueOrganicSightWords as the child replies.
+func StartOrganicSightWords(esn string) {
+	config := LoadSightWords()
+	robot, err := getRobot(esn)
+	if err != nil {
+		logger.Println("sight words: " + err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if _, err := robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{}); err != nil {
+		logger.Println("sight words: unable to reach robot " + esn + ": " + err.Error())
+		cancel()
+		return
+	}
+
+	if len(config.Words) == 0 {
+		presenter := &robotSightWordsPresenter{robot: robot, ctx: ctx}
+		presenter.Say(sightWordsEmptyList)
+		cancel()
+		return
+	}
+
+	actions, claimed := registerSightWordsSession(esn)
+	if !claimed {
+		logger.Println("sight words: " + esn + " is already practicing")
+		cancel()
+		return
+	}
+
+	start := make(chan bool, 1)
+	stop := make(chan bool, 1)
+	BControl(robot, ctx, start, stop)
+	select {
+	case <-start:
+	case <-time.After(sightWordsControlTimeout):
+		select {
+		case stop <- true:
+		default:
+		}
+		unregisterSightWordsSession(esn)
+		cancel()
+		logger.Println("sight words: timed out waiting for behavior control")
+		return
+	}
+
+	session := &organicSightWordsSession{
+		presenter: &robotSightWordsPresenter{robot: robot, ctx: ctx},
+		state:     newOrganicSightWordsState(config.Words),
+		conf:      LLMConfig(),
+		ctx:       ctx,
+		cancel:    cancel,
+		releaseControl: func() {
+			select {
+			case stop <- true:
+			default:
+			}
+		},
+	}
+
+	organicSightWordsMutex.Lock()
+	organicSightWordsSessions[esn] = session
+	organicSightWordsMutex.Unlock()
+
+	session.idleTimer = time.AfterFunc(organicSightWordsIdleTimeout, func() {
+		logger.Println("sight words: organic conversation with " + esn + " timed out")
+		endOrganicSightWords(esn)
+	})
+
+	// the shared session registry is only used here to detect "stop sight
+	// words" and to know a session is active; next/repeat don't apply to an
+	// organic conversation and are ignored.
+	go func() {
+		for {
+			select {
+			case action, ok := <-actions:
+				if !ok {
+					return
+				}
+				if action == sightWordsStop {
+					endOrganicSightWords(esn)
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	logger.Println("sight words: starting organic practice on " + esn + " with " + strconv.Itoa(len(config.Words)) + " words")
+	logger.LogUI("Organic sight words practice started on " + esn)
+
+	reply, err := session.conf.Complete(ctx, llm.Request{
+		System: organicSightWordsSystemPrompt(session.state.remaining()),
+	})
+	if err != nil || strings.TrimSpace(reply) == "" {
+		if err != nil {
+			logger.Println("sight words: organic opening failed: " + err.Error())
+		} else {
+			logger.Println("sight words: organic opening returned no text")
+		}
+		session.presenter.Say(sightWordsOrganicLLMError)
+		endOrganicSightWords(esn)
+		return
+	}
+
+	session.mu.Lock()
+	session.state.markSpoken(reply)
+	session.messages = append(session.messages, llm.Message{Role: llm.RoleAssistant, Content: reply})
+	done := session.state.allCovered()
+	session.mu.Unlock()
+
+	session.presenter.Say(reply)
+	if done {
+		session.presenter.Say(sightWordsOrganicDone)
+		endOrganicSightWords(esn)
+	}
+}
+
+// ContinueOrganicSightWords delivers one more thing the child said to a
+// running organic session, gets the LLM's reply and has Vector say it,
+// ending the session once every active word has come up.
+func ContinueOrganicSightWords(esn string, voiceText string) {
+	session, ok := getOrganicSightWordsSession(esn)
+	if !ok {
+		return
+	}
+
+	session.mu.Lock()
+	select {
+	case <-session.ctx.Done():
+		session.mu.Unlock()
+		return
+	default:
+	}
+	if session.idleTimer != nil {
+		session.idleTimer.Reset(organicSightWordsIdleTimeout)
+	}
+	session.state.markSpoken(voiceText)
+	session.messages = append(session.messages, llm.Message{Role: llm.RoleUser, Content: voiceText})
+	remaining := session.state.remaining()
+	messages := append([]llm.Message{}, session.messages...)
+	conf := session.conf
+	ctx := session.ctx
+	session.mu.Unlock()
+
+	reply, err := conf.Complete(ctx, llm.Request{
+		System:   organicSightWordsSystemPrompt(remaining),
+		Messages: messages,
+	})
+	if err != nil || strings.TrimSpace(reply) == "" {
+		if err != nil {
+			logger.Println("sight words: organic reply failed: " + err.Error())
+		} else {
+			logger.Println("sight words: organic reply returned no text")
+		}
+		return
+	}
+
+	session.mu.Lock()
+	session.state.markSpoken(reply)
+	session.messages = append(session.messages, llm.Message{Role: llm.RoleAssistant, Content: reply})
+	done := session.state.allCovered()
+	session.mu.Unlock()
+
+	session.presenter.Say(reply)
+	if done {
+		session.presenter.Say(sightWordsOrganicDone)
+		endOrganicSightWords(esn)
+	}
+}
+
+// stopOrganicSightWords ends a session in response to an explicit "stop
+// sight words" from the child, saying goodbye first.
+func stopOrganicSightWords(esn string) {
+	session, ok := getOrganicSightWordsSession(esn)
+	if !ok {
+		return
+	}
+	session.presenter.Say(sightWordsStopped)
+	endOrganicSightWords(esn)
+}
+
+// endOrganicSightWords tears down a session: it stops the idle timer,
+// cancels the context, gives behavior control back and frees the slot in
+// both the organic and shared session registries.
+func endOrganicSightWords(esn string) {
+	organicSightWordsMutex.Lock()
+	session, exists := organicSightWordsSessions[esn]
+	if exists {
+		delete(organicSightWordsSessions, esn)
+	}
+	organicSightWordsMutex.Unlock()
+	if !exists {
+		return
+	}
+	if session.idleTimer != nil {
+		session.idleTimer.Stop()
+	}
+	session.presenter.Clear()
+	session.cancel()
+	session.releaseControl()
+	unregisterSightWordsSession(esn)
+	logger.Println("sight words: organic practice ended on " + esn)
 }
