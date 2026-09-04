@@ -8,6 +8,12 @@ It allows voice commands to work with any Vector 1.0 or 2.0 for no fee, includin
 
 The installation guide exists on the wiki: [Installation guide](https://github.com/kercre123/wire-pod/wiki/Installation)
 
+## Sight words practice
+
+Vector can help a child practice sight words: he shows each word from a
+caregiver-editable list on his screen and says it out loud. See
+[docs/sight-words.md](docs/sight-words.md) for setup and usage.
+
 ## Wiki
 
 Check out the [wiki](https://github.com/kercre123/wire-pod/wiki) for more information on what wire-pod is, a guide on how to install wire-pod, troubleshooting, how to develop for it, and for some generally helpful tips.

@@ -1,0 +1,234 @@
+package wirepod_ttr
+
+// Robot-facing half of sight words practice: showing words on Vector's
+// screen, saying them, and keeping track of which robots have a session
+// running so follow-up commands can be routed to them.
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/fforchino/vector-go-sdk/pkg/vector"
+	"github.com/fforchino/vector-go-sdk/pkg/vectorpb"
+	"github.com/kercre123/wire-pod/chipper/pkg/logger"
+	"github.com/kercre123/wire-pod/chipper/pkg/scripting"
+)
+
+// how long to wait for behavior control before giving up on the session
+const sightWordsControlTimeout = time.Second * 15
+
+// screen brightness, as a percentage, used when converting a word to the
+// format Vector's screen expects
+const sightWordsOpacityPercent = 100
+
+var (
+	sightWordsMutex    sync.Mutex
+	sightWordsSessions = map[string]chan sightWordsAction{}
+)
+
+// registerSightWordsSession claims the session slot for a robot. It returns
+// false if that robot is already practicing.
+func registerSightWordsSession(esn string) (chan sightWordsAction, bool) {
+	sightWordsMutex.Lock()
+	defer sightWordsMutex.Unlock()
+	if _, exists := sightWordsSessions[esn]; exists {
+		return nil, false
+	}
+	actions := make(chan sightWordsAction, 4)
+	sightWordsSessions[esn] = actions
+	return actions, true
+}
+
+func unregisterSightWordsSession(esn string) {
+	sightWordsMutex.Lock()
+	defer sightWordsMutex.Unlock()
+	delete(sightWordsSessions, esn)
+}
+
+// SightWordsSessionActive reports whether the given robot is in the middle of
+// a sight words practice session.
+func SightWordsSessionActive(esn string) bool {
+	sightWordsMutex.Lock()
+	defer sightWordsMutex.Unlock()
+	_, exists := sightWordsSessions[esn]
+	return exists
+}
+
+// sendSightWordsAction hands a follow-up command to a running session. It
+// never blocks, so a burst of commands can't wedge the voice pipeline.
+func sendSightWordsAction(esn string, action sightWordsAction) bool {
+	sightWordsMutex.Lock()
+	actions, exists := sightWordsSessions[esn]
+	sightWordsMutex.Unlock()
+	if !exists {
+		return false
+	}
+	select {
+	case actions <- action:
+		return true
+	default:
+		return false
+	}
+}
+
+// robotSightWordsPresenter shows and says words on a real robot.
+type robotSightWordsPresenter struct {
+	robot *vector.Vector
+	ctx   context.Context
+}
+
+func (p *robotSightWordsPresenter) Show(word string, holdMs uint32) error {
+	faceData := sightWordFaceData(word)
+	_, err := p.robot.Conn.DisplayFaceImageRGB(
+		p.ctx,
+		&vectorpb.DisplayFaceImageRGBRequest{
+			FaceData:         faceData,
+			DurationMs:       holdMs,
+			InterruptRunning: true,
+		},
+	)
+	return err
+}
+
+func (p *robotSightWordsPresenter) Say(text string) error {
+	if text == "" {
+		return nil
+	}
+	_, err := p.robot.Conn.SayText(
+		p.ctx,
+		&vectorpb.SayTextRequest{
+			Text:           text,
+			UseVectorVoice: true,
+			DurationScalar: 1.0,
+		},
+	)
+	return err
+}
+
+// Clear blanks the screen so the word doesn't linger once practice is over.
+// Behavior control is released by StartSightWords, which brings back the face.
+func (p *robotSightWordsPresenter) Clear() {
+	_, err := p.robot.Conn.DisplayFaceImageRGB(
+		p.ctx,
+		&vectorpb.DisplayFaceImageRGBRequest{
+			FaceData:         sightWordFaceData(""),
+			DurationMs:       100,
+			InterruptRunning: true,
+		},
+	)
+	if err != nil {
+		logger.Println("sight words: unable to clear the screen: " + err.Error())
+	}
+}
+
+// sightWordFaceData renders a word into the 16 bit format Vector's screen
+// expects. An empty word gives a blank screen.
+func sightWordFaceData(word string) []byte {
+	pixels := scripting.ConvertPixelsToRawBitmap(RenderSightWord(word), sightWordsOpacityPercent)
+	buf := new(bytes.Buffer)
+	for _, pixel := range pixels {
+		binary.Write(buf, binary.LittleEndian, pixel)
+	}
+	return buf.Bytes()
+}
+
+// StartSightWords runs one sight words practice session on the given robot.
+// It blocks until practice is finished, stopped or has errored, and always
+// gives behavior control back.
+func StartSightWords(esn string) error {
+	config := LoadSightWords()
+	robot, err := getRobot(esn)
+	if err != nil {
+		logger.Println("sight words: " + err.Error())
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := robot.Conn.BatteryState(ctx, &vectorpb.BatteryStateRequest{}); err != nil {
+		logger.Println("sight words: unable to reach robot " + esn + ": " + err.Error())
+		return err
+	}
+
+	actions, claimed := registerSightWordsSession(esn)
+	if !claimed {
+		logger.Println("sight words: " + esn + " is already practicing")
+		return errors.New("sight words practice is already running")
+	}
+	defer unregisterSightWordsSession(esn)
+
+	// buffered so signalling can never leak a goroutine
+	start := make(chan bool, 1)
+	stop := make(chan bool, 1)
+	BControl(robot, ctx, start, stop)
+	releaseControl := func() {
+		select {
+		case stop <- true:
+		default:
+		}
+	}
+	select {
+	case <-start:
+	case <-time.After(sightWordsControlTimeout):
+		releaseControl()
+		logger.Println("sight words: timed out waiting for behavior control")
+		return errors.New("timed out waiting for behavior control")
+	}
+	defer releaseControl()
+
+	logger.Println("sight words: starting practice on " + esn + " with " + strconv.Itoa(len(config.Words)) + " words")
+	logger.LogUI("Sight words practice started on " + esn)
+
+	presenter := &robotSightWordsPresenter{robot: robot, ctx: ctx}
+	waitForAction := func(hold time.Duration) sightWordsAction {
+		timer := time.NewTimer(hold)
+		defer timer.Stop()
+		select {
+		case action := <-actions:
+			return action
+		case <-timer.C:
+			return sightWordsTimeout
+		case <-ctx.Done():
+			return sightWordsStop
+		}
+	}
+	err = runSightWordsSession(presenter, config.Words, config.HoldTime(), waitForAction)
+	if err != nil {
+		logger.Println("sight words: practice ended early: " + err.Error())
+	} else {
+		logger.Println("sight words: practice finished on " + esn)
+	}
+	return err
+}
+
+// sightWordsHandler matches the sight words trigger phrases and the follow-up
+// commands. It is checked alongside plugins and custom intents in
+// ProcessTextAll, and returns true when it took the utterance.
+func sightWordsHandler(req interface{}, voiceText string, botSerial string) bool {
+	action, isStart, matched := sightWordsCommand(voiceText, SightWordsSessionActive(botSerial))
+	if !matched {
+		return false
+	}
+	if isStart {
+		logger.Println("Bot " + botSerial + " matched sight words practice")
+		IntentPass(req, "intent_greeting_hello", voiceText, map[string]string{}, false)
+		go func() {
+			// the robot needs a moment to finish reacting to the intent
+			time.Sleep(time.Millisecond * 200)
+			StartSightWords(botSerial)
+		}()
+		return true
+	}
+	logger.Println("Bot " + botSerial + " matched a sight words session command")
+	IntentPass(req, "intent_imperative_affirmative", voiceText, map[string]string{}, false)
+	if !sendSightWordsAction(botSerial, action) {
+		logger.Println("Bot " + botSerial + " sight words command could not be delivered, the session may have just ended")
+	}
+	return true
+}
