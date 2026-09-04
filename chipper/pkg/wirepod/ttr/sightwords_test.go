@@ -132,6 +132,30 @@ func TestRenderSightWord(t *testing.T) {
 
 var errNoScreen = errors.New("screen is not available")
 
+// Every character a sight word may contain must have a well formed glyph, so
+// no letter is ever silently missing from the screen.
+func TestSightWordFontCoversAllowedCharacters(t *testing.T) {
+	allowed := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'-\u2019"
+	for _, r := range allowed {
+		glyph, ok := sightWordGlyph(r)
+		if !ok {
+			t.Fatalf("no glyph for %q", r)
+		}
+		rows := strings.Split(glyph, "/")
+		if len(rows) != sightWordGlyphHeight {
+			t.Fatalf("glyph for %q has %d rows, want %d", r, len(rows), sightWordGlyphHeight)
+		}
+		for _, row := range rows {
+			if len(row) != sightWordGlyphWidth {
+				t.Fatalf("glyph for %q has a row of width %d, want %d", r, len(row), sightWordGlyphWidth)
+			}
+			if strings.Trim(row, "#.") != "" {
+				t.Fatalf("glyph for %q has an unexpected character in row %q", r, row)
+			}
+		}
+	}
+}
+
 // fakeSightWordsPresenter records what a session asked the robot to do.
 type fakeSightWordsPresenter struct {
 	events    []string

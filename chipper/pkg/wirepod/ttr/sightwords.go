@@ -24,10 +24,6 @@ import (
 	"time"
 	"unicode"
 
-	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
-
 	"github.com/kercre123/wire-pod/chipper/pkg/logger"
 	"github.com/kercre123/wire-pod/chipper/pkg/vars"
 )
@@ -181,52 +177,58 @@ func LoadSightWords() SightWordsConfig {
 }
 
 // RenderSightWord draws one word, white on black, as large as will fit on
-// Vector's screen. The font is the bundled bitmap font scaled up with nearest
-// neighbour sampling, which keeps the letters blocky and readable on the small
-// display and avoids shipping font files.
+// Vector's screen. The blocky bitmap font in sightwords_font.go is scaled up
+// with whole pixels, which stays readable on the small display.
 func RenderSightWord(word string) image.Image {
 	screen := image.NewRGBA(image.Rect(0, 0, SightWordScreenWidth, SightWordScreenHeight))
 	draw.Draw(screen, screen.Bounds(), image.NewUniform(color.Black), image.Point{}, draw.Src)
-	word = strings.TrimSpace(word)
-	if word == "" {
+
+	var glyphs []string
+	for _, r := range strings.TrimSpace(word) {
+		glyph, ok := sightWordGlyph(r)
+		if !ok {
+			glyph, _ = sightWordGlyph('-')
+		}
+		glyphs = append(glyphs, glyph)
+	}
+	if len(glyphs) == 0 {
 		return screen
 	}
 
-	face := basicfont.Face7x13
-	metrics := face.Metrics()
-	textWidth := font.MeasureString(face, word).Ceil()
-	ascent := metrics.Ascent.Ceil()
-	textHeight := ascent + metrics.Descent.Ceil()
-	if textWidth < 1 || textHeight < 1 {
-		return screen
-	}
+	textWidth := len(glyphs)*(sightWordGlyphWidth+sightWordGlyphSpacing) - sightWordGlyphSpacing
+	scale := sightWordScale(textWidth, sightWordGlyphHeight)
+	offsetX := (SightWordScreenWidth - textWidth*scale) / 2
+	offsetY := (SightWordScreenHeight - sightWordGlyphHeight*scale) / 2
 
-	text := image.NewRGBA(image.Rect(0, 0, textWidth, textHeight))
-	draw.Draw(text, text.Bounds(), image.NewUniform(color.Black), image.Point{}, draw.Src)
-	drawer := &font.Drawer{
-		Dst:  text,
-		Src:  image.NewUniform(color.White),
-		Face: face,
-		Dot:  fixed.P(0, ascent),
-	}
-	drawer.DrawString(word)
-
-	scale := sightWordScale(textWidth, textHeight)
-	scaledWidth := textWidth * scale
-	scaledHeight := textHeight * scale
-	offsetX := (SightWordScreenWidth - scaledWidth) / 2
-	offsetY := (SightWordScreenHeight - scaledHeight) / 2
-	for y := 0; y < scaledHeight; y++ {
-		for x := 0; x < scaledWidth; x++ {
-			screenX := offsetX + x
-			screenY := offsetY + y
-			if screenX < 0 || screenX >= SightWordScreenWidth || screenY < 0 || screenY >= SightWordScreenHeight {
-				continue
+	white := color.RGBA{255, 255, 255, 255}
+	for i, glyph := range glyphs {
+		glyphX := i * (sightWordGlyphWidth + sightWordGlyphSpacing)
+		for y := 0; y < sightWordGlyphHeight; y++ {
+			for x := 0; x < sightWordGlyphWidth; x++ {
+				if !sightWordGlyphLit(glyph, x, y) {
+					continue
+				}
+				fillSightWordPixel(screen, offsetX+(glyphX+x)*scale, offsetY+y*scale, scale, white)
 			}
-			screen.Set(screenX, screenY, text.At(x/scale, y/scale))
 		}
 	}
 	return screen
+}
+
+// fillSightWordPixel draws one scaled-up font pixel, skipping anything which
+// would fall outside of the screen.
+func fillSightWordPixel(screen *image.RGBA, startX, startY, scale int, c color.Color) {
+	for y := startY; y < startY+scale; y++ {
+		if y < 0 || y >= SightWordScreenHeight {
+			continue
+		}
+		for x := startX; x < startX+scale; x++ {
+			if x < 0 || x >= SightWordScreenWidth {
+				continue
+			}
+			screen.Set(x, y, c)
+		}
+	}
 }
 
 // sightWordScale is the largest whole-pixel scale which keeps the word inside

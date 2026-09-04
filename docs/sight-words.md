@@ -87,8 +87,9 @@ A session never depends on those commands: each word advances on its own after
   wire-pod is driving his screen he is less responsive to it than usual. If a
   follow-up command is missed, simply wait for the word to advance on its own,
   or say `Hey Vector, stop sight words`.
-- Words are drawn with a scaled bitmap font. The screen is 184x96 pixels, so
-  short words fill the screen while longer words are drawn smaller. This uses
+- Words are drawn with a small built-in bitmap font, so no font files or
+  extra libraries are needed. The screen is 184x96 pixels, so short words fill
+  the screen while longer words are drawn smaller. Drawing uses
   the robot's `DisplayFaceImageRGB` API, the same one wire-pod's Lua scripting
   uses for `showImage`, which is the supported way to put custom pixels on the
   face.
@@ -101,6 +102,8 @@ A session never depends on those commands: each word advances on its own after
 
 - `chipper/pkg/wirepod/ttr/sightwords.go` - word list configuration, screen
   rendering, trigger phrases and the practice sequence
+- `chipper/pkg/wirepod/ttr/sightwords_font.go` - the bitmap font the words are
+  drawn with
 - `chipper/pkg/wirepod/ttr/sightwords_robot.go` - the robot side: behavior
   control, showing/saying words and per-robot session state
 - `chipper/pkg/wirepod/ttr/sightwords_test.go` - tests for the configuration
