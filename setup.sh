@@ -237,7 +237,7 @@ function getSTT() {
             cd whisper.cpp
         fi
         function whichWhisperModel() {
-            availableModels="tiny, base, small, medium, large-v3, large-v3-q5_0"
+            availableModels="tiny, base, small, medium, large-v3, large-v3-q5_0, whisper-large-v3-turbo"
             echo
             echo "Which Whisper model would you like to use?"
             echo "Options: $availableModels"
