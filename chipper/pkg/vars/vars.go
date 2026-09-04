@@ -36,6 +36,7 @@ var (
 	JdocsPath         string = "./jdocs/jdocs.json"
 	JdocsDir          string = "./jdocs"
 	CustomIntentsPath string = "./customIntents.json"
+	SightWordsPath    string = "./sightWords.json"
 	BotConfigsPath    string = "./botConfig.json"
 	BotInfoPath       string = "./jdocs/botSdkInfo.json"
 	BotInfoName       string = "botSdkInfo.json"
@@ -169,6 +170,7 @@ func Init() {
 		JdocsDir = join(podDir, JdocsDir)
 		JdocsPath = JdocsDir + "/jdocs.json"
 		CustomIntentsPath = join(podDir, CustomIntentsPath)
+		SightWordsPath = join(podDir, SightWordsPath)
 		BotConfigsPath = join(podDir, BotConfigsPath)
 		BotInfoPath = JdocsDir + "/" + BotInfoName
 		VoskModelPath = join(podDir, "./vosk/models/")
